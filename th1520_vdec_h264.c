@@ -4,26 +4,32 @@
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 控件到寄存器的映射来自 analysis/vc8000d-register-config/swreg-map-h264.md
- * （由真实二进制的 H.264 规格表 @0x4D40A0 dump 得到）。
+ * 控件到寄存器的映射来自 VC8000D 产品表（product id 0x8001，
+ * 表 @0x4CBB80；位域图 analysis/vc8000d-register-config/swreg-map-vc8000d.md，
+ * 分析与 golden 对照见 analysis/vc8000d-product-table.md）。
+ * G1 表（@0x4D40A0）的字段位置对 TH1520 无效——产品表把 H.264 的
+ * 地址寄存器统一到了 HEVC 风格位置（STREAM@168/169、OUT@64/65、
+ * REF@66+2i/67+2i、DIRMV@132/133、QTABLE@174/175），START_CODE_E/INIT_QP
+ * 统一在 swreg13[31]/[30:24]，STREAM_LEN 为 32 bit。
  *
  * DPB 匹配、参考列表构建与 CABAC/POC/缩放矩阵表的布局，参考上游
  * drivers/media/platform/verisilicon/{hantro_h264.c,hantro_g1_h264_dec.c}
  * （GPL-2.0，Copyright (c) 2014 Rockchip Electronics / Google Inc.，
  *  Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4）。
  *
- * 上游 G1 寄存器偏移与本二进制规格表的对应关系（已逐条核对）：
- *   G1_REG_ADDR_STR    0x030 = swreg12  RLC_VLC_BASE_LSB
- *   G1_REG_ADDR_DST    0x034 = swreg13  DEC_OUT_BASE_LSB
- *   G1_REG_ADDR_REF(i) 0x038 = swreg14+i REFERi_BASE_LSB
- *   G1_REG_REF_PIC(i)  0x078 = swreg30+i REFERn_NBR
- *   G1_REG_LT_REF      0x098 = swreg38  REFER_LTERM_E
- *   G1_REG_VALID_REF   0x09c = swreg39  REFER_VALID_E
- *   G1_REG_ADDR_QTABLE 0x0a0 = swreg40  QTABLE_BASE_LSB
- *   G1_REG_ADDR_DIR_MV 0x0a4 = swreg41  DIR_MV_BASE_LSB
- *   G1_REG_BD_REF_PIC  0x0a8 = swreg42+i BINIT_RLIST_*
- *   G1_REG_BD_P_REF_PIC 0x0bc = swreg47
- *   G1_REG_FWD_PIC(i)  0x028 = swreg10+i PINIT_RLIST_F4..15
+ * 产品表与上游 G1 布局同位置的寄存器（已逐 id 核对，见
+ * analysis/vc8000d-product-table.md §5.4）：
+ *   REFERn_NBR         swreg30+i（每个寄存器两个 16 bit frame_num）
+ *   REFER_LTERM_E      swreg38
+ *   REFER_VALID_E      swreg39
+ *   BINIT_RLIST_*      swreg42+i（B 帧 L0/L1 初始列表）
+ *   B_REF_PIC 第15项+P前4项 swreg47
+ *   PINIT_RLIST_F4..15 swreg10/11（P 帧 L0 初始列表）
+ *   PRED_BC_TAP_0_x    swreg49
+ * 与上游 G1 布局不同、已按产品表改写的：全部地址寄存器、
+ * START_CODE_E/INIT_QP、STRM_START_BIT（7 bit）、STREAM_LEN（32 bit）、
+ * APF_THRESHOLD（16 bit）、swreg2（只有 swap 域+CLK_GATE_E）、
+ * MAX_BURST/BUSWIDTH/AXI_RD_ID_E（swreg58）、超时（swreg318/319）。
  */
 
 #include <linux/bitmap.h>
@@ -542,24 +548,16 @@ static int th1520_h264_prepare_run(struct th1520_vdec_ctx *ctx)
 
 static int th1520_h264_run(struct th1520_vdec_ctx *ctx)
 {
-	struct vb2_v4l2_buffer *src_buf;
 	int ret;
 
 	ret = th1520_h264_prepare_run(ctx);
 	if (ret)
 		goto err_complete_request;
 
-	src_buf = th1520_vdec_get_src_buf(ctx);
-	if (vb2_get_plane_payload(&src_buf->vb2_buf, 0) >
-	    TH1520_H264_MAX_STREAM_LEN) {
-		/* STREAM_LEN 只有 24 bit。 */
-		dev_err_ratelimited(ctx->dev->dev,
-				    "H.264 stream chunk too large (%lu bytes)\n",
-				    vb2_get_plane_payload(&src_buf->vb2_buf, 0));
-		ret = -EINVAL;
-		goto err_complete_request;
-	}
-
+	/*
+	 * STREAM_LEN 在产品表中是完整 32 bit（与 HEVC 相同），
+	 * G1 表的 24 bit 截断在 VC8000D 上不适用，无需再做长度检查。
+	 */
 	th1520_vdec_set_common_config(ctx);
 	th1520_h264_set_params(ctx);
 	th1520_h264_set_ref(ctx);

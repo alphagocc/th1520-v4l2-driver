@@ -233,6 +233,9 @@ ENUM_FMT 恰好在它身上中断导致格式集为空；`VIDIOC_(TRY_)DECODER_C
 
 ### 6.0.2 Golden 寄存器抓取：TH1520 走 VCMD（重大结论）
 
+> **⚠️ 2026-08-13 更正（见 §6.0.3）：本节部分结论基于 G1/G2 寄存器表解码 golden，
+> 已在 `analysis/vc8000d-product-table.md` 中被推翻。保留原文作比对记录，解读时以 §6.0.3 为准。**
+
 用厂商 GPL 源码编了一个带 instrumentation 的 `hantrodec.ko`，用 ffmpeg 的
 `hevc_omx` 解同一个测试文件，抓到了**一次成功解码实际使用的寄存器集合**。
 
@@ -312,7 +315,86 @@ python3 analysis/parse_golden_cmdbuf.py analysis/golden-cmdbuf-raw.txt
 
 
 
-### 6.1 待硬件验证项
+### 6.0.3 产品表更正：TH1520 实际使用 0x4CBB80 表（2026-08-13）
+
+用 IDA MCP 复核 `.so` 的 `SetDecRegister`（`lib/common/regdrv.c`）：运行时按
+`HIWORD(container->regs[0])` 三路选表 —— `0x6731`→G1 表、`0x6732`→G2 表、
+**`0x8001`→`0x4CBB80` 表**；`HevcDecInit` 把 `DWLReadAsicID()` 写入 `regs[0]`。
+TH1520 实测 `swreg0=0x80018000`（product `0x8001`），所以**真实硅片上 H.264/HEVC
+解码用的都是 `0x4CBB80` 这张全 codec 联合表**，G1/G2 表只对旧 product 有效。
+早期分析把 `0x8001` 标成 “JPEG 表”是错的。完整证据与字段级 golden 解码见
+`analysis/vc8000d-product-table.md`（新增）与 `analysis/vc8000d-register-config/swreg-map-vc8000d.md`
+（新生成的产品表位域图，469 swreg / 1902 字段）。
+
+对 §6.0.2 的逐条更正（原文保留如上）：
+
+| §6.0.2 旧结论 | 更正（产品表实测） |
+| --- | --- |
+| golden `START_CODE_E=0`，厂商软件剥离起始码 | **`START_CODE_E=1`（swreg13[31]）**，码流带 3 字节起始码，硬件自行搜索。旧结论是把 golden 按 G2 表（swreg10[31]）解码造成的误读 |
+| golden swreg10 `00021000` 的 `INIT_QP=0` | INIT_QP 在产品表中位于 **swreg13[30:24]，golden=26**（与 GStreamer 计算一致）；`0x21000` 是 `NUM_TILE_COLS_8K`[23:17] / `NUM_TILE_ROWS_8K`[16:12] 各为 1 |
+| swreg13 高位 `0x9a00_0000` “未定义，待查” | = `START_CODE_E`[31] + `INIT_QP(26)`[30:24] |
+| §6.0.1：`LAST_BUFFER_E`(swreg3[8]) 必须置 1 | 产品表 swreg3[8] = **`DEC_OUT_EC_BYPASS`**；真正的 `LAST_BUFFER_E` 是 swreg3[0]，golden 为 **0**。当年“置 1 后硬件才跑完”的真实机制是 bit8=1 关闭了参考帧压缩（否则压缩表基址=0 导致挂死）——该实验作为 EC_BYPASS 证据仍有效，但字段名/位号错了 |
+| swreg58 `CLK_GATE_E`[16]=0 | 产品表 swreg58 无此字段；真实 `CLK_GATE_E` = **swreg2[10]**（golden=1） |
+| “本驱动完全没有配置 L2CACHE 与 DEC400” | 仍成立：golden 含 L2CACHE 87 + DEC400 69 + MMU 1 寄存器（`golden-cmdbuf-raw.txt`），驱动未配置；在 EC_BYPASS=1 旁路模式下是否需要，待上板验证 |
+
+**当前解码失败的直接根因**：驱动把 `START_CODE_E=1` 写进 swreg10[31]（真实硅片上该位
+无此语义），真实 `START_CODE_E`（swreg13[31]）保持 0 —— 硬件按“无起始码”解析带
+`00 00 01` 前缀的 Annex-B 缓冲 → `DEC_ERROR_INT + DEC_STRM_CORRUPTED`（4 KB 输出后报错）。
+
+**下一步修复**（详见 `analysis/vc8000d-product-table.md` §5，按依赖顺序；
+**2026-08-13 已全部实施**，见本文件 §6.0.4）：
+
+1. `th1520_vdec_regs.h` HEVC 位域按产品表重定义：swreg3 低位区（EC_BYPASS[8]/APF_ONE_PID[7]/
+   REF_READ_DIS[6]/L2_SHAPER_E[5]/BUFFER_EMPTY_INT_E[2]/BLOCK_BUFFER_MODE_E[1]/LAST_BUFFER_E[0]）、
+   swreg10 8K tile 位域、swreg13 增加 START_CODE_E[31]+INIT_QP[30:24]、
+   swreg58 删 CLK_GATE 两项、AXI ID 移到 swreg60。
+2. `th1520_vdec_hw.c`：删 comp_table_swap；AXI_RD_ID_E=1；补 swreg318/319=0x80500000。
+3. `th1520_vdec_hevc.c`：START_CODE_E=1、INIT_QP→swreg13、tile 计数→8K 位域、
+   REF_READ_DIS（I 帧=1）；dump_list 增补 60/265/318/319/320+ 等。
+4. H.264 后端同样整体重查：产品表把 H.264 地址 id 统一到 HEVC 风格位置
+   （STREAM→168/169、OUT→65、REF→66+2i、DIFF_MV→173…），驱动 `TH1520_H264_ADDR_*`
+   全部失效；START_CODE_E/INIT_QP 也在 swreg13；STREAM_LEN 为 32bit。
+
+### 6.0.4 产品表修复实施记录（2026-08-13）
+
+按 §6.0.3 的清单修改了驱动（`th1520_vdec_regs.h` 的 H.264/HEVC 两段全部
+按产品表重定义并保留逐字段依据注释；`th1520_vdec_hw.c` 的 common config
+对齐 golden；`th1520_vdec_hevc.c` / `th1520_vdec_h264.c` 后端相应迁移）：
+
+| 项 | 修改前 | 修改后 |
+| --- | --- | --- |
+| swreg2（两 codec） | H.264 写一票 G1 位；HEVC 写 raw 0x400 | 都写 raw `0x00000400`（swap=0 + CLK_GATE_E） |
+| START_CODE_E | swreg10[31]（HEVC）/ swreg6[31]（H.264） | **swreg13[31]**，值 1（Annex-B 缓冲） |
+| INIT_QP | swreg10[30:24] / swreg6[25] | **swreg13[30:24]**，7 bit |
+| OUT_EC_BYPASS | swreg3[17]（写错位） | **swreg3[8]**，保持 1（旁路，见下） |
+| LAST_BUFFER_E / BUFFER_EMPTY_INT_E | swreg3[8]/[10]（错位） | **swreg3[0]/[2]**，golden 值 0 / 1 |
+| tile 计数 | 旧位域 [23:19]/[18:14] | **8K 位域 [23:17]/[16:12]** |
+| CLK_GATE_E（HEVC） | swreg58[16]（垃圾位） | swreg2[10]（含于 raw 0x400） |
+| 超时看门狗 | 不写 | swreg318/319 = `0x80500000`（golden） |
+| AXI_RD_ID_E | 0 | 1（golden） |
+| AXI ID 寄存器 | swreg59 | **swreg60** |
+| H.264 地址寄存器 | G1 位置（12/122、13/123、14+i…） | 统一位置（168/169、64/65、66+2i、132/133、174/175） |
+| H.264 STREAM_LEN | 24 bit + 长度检查 | **32 bit**（产品表 id 161） |
+| H.264 swreg2 旧位 | timeout_e/swap32/endian/latency/max_burst… | 全部删除（产品表不存在） |
+| REF_READ_DIS | 无 | swreg3[6] = **0**（旁路路径；golden 压缩路径=1，待硬件验证） |
+| swreg265 | 无 | 不写（旁路路径；golden 压缩路径=0x81004000，记录为差异） |
+| dump_list | 到 314 | 增补 60/265/318/319/320/322/326/328/329/331/332/394 |
+
+**遗留的已知差异（不影响本次流解析修复，上板后逐步处理）**：
+
+1. **压缩路径**：golden 是 OUT_EC_BYPASS=0 + L2CACHE(87 寄存器) + DEC400(69) +
+   MMU flush + swreg3[3] + swreg265；驱动是旁路=1。旁路能否端到端工作待实测。
+2. **输出格式**：解码核原生输出非线形 NV12（golden C stride=160 vs Y=320），
+   线性 NV12 需要后处理器（swreg320-332 + 394）或导出 `V4L2_PIX_FMT_NV12_4L4`。
+3. **REF_READ_DIS 的置位规则**：golden（压缩路径）为 1；写者不在 regcalls.json
+   捕获集内。旁路路径暂取 0，P 帧行为待硬件验证。
+
+**上板重测顺序**：HEVC I 帧 → 看 `swreg1` 状态与 `swreg260` 错误定位 →
+H.264 baseline → CABAC/B 帧。若有错，用扩表后的 dump 与 golden 逐字段比对。
+
+
+
+
 
 以下每一项在代码里都有对应注释。注意 §6.0.2 已经用 golden 抓取回答了
 其中的 VCMD 一项，并把 swap 域一项从"推测"变成了"实测为 0"。
@@ -342,15 +424,19 @@ HEVC 的地址寄存器是规整的 (MSB, LSB) 对，理论上支持 64 bit。
 
 ### 6.3 G2 的 swap 域取值
 
-`th1520_vdec_hw.c` 的 `TH1520_G2_SWAP_LE = 0xf` 应用于 swreg2 的全部 8 个 swap 域。
+> **2026-08-13 已废弃**：产品表更正后 swreg2 只保留四组 swap 域
+> （STRM/PIC/DIRMV/TAB），厂商栈全部写 0，驱动直接写整字 `0x00000400`
+> （= CLK_GATE_E[10]）。旧内容保留如下：
 
-- `DEC_STRM_SWAP` / `DEC_DIRMV_SWAP` / `DEC_COMP_TABLE_SWAP` 取 `0xf`
+~~`th1520_vdec_hw.c` 的 `TH1520_G2_SWAP_LE = 0xf` 应用于 swreg2 的全部 8 个 swap 域。~~
+
+~~- `DEC_STRM_SWAP` / `DEC_DIRMV_SWAP` / `DEC_COMP_TABLE_SWAP` 取 `0xf`
   与上游 mainline 一致（位置也逐位吻合）—— 已验证。
 - `DEC_PIC_SWAP` / `DEC_TAB0..3_SWAP` / `DEC_RSCAN_SWAP` 在上游是不同修订的
   位宽与位置，上游 HEVC 路径根本不写它们；本驱动按同一小端约定取 `0xf`
-  —— **参考性推测**。
+  —— **参考性推测**。~~
 
-若目标板上出现色度平面或 direct-MV 数据字节序错乱，把该常量改成 `0` 重测。
+~~若目标板上出现色度平面或 direct-MV 数据字节序错乱，把该常量改成 `0` 重测。~~
 
 ### 6.4 H.264 CABAC 表的排布
 
@@ -368,10 +454,12 @@ H.264 baseline/main（值 0）两者结果相同，因此当前配置不受影�
 
 ### 6.6 硬件超时看门狗
 
-`.so` 会写 swreg318/319（H.264）和 swreg44/45（HEVC）的周期覆盖值
-（H.264 为 5242880 / 10485760 周期）。本驱动**不写**这些覆盖寄存器，
-改为：H.264 打开 `swreg2[23] DEC_TIMEOUT_E` 使用硬件默认看门狗（与上游一致），
-再加驱动侧 2 秒软件看门狗兜底。不发明周期数是为了避免误中止正常解码。
+**2026-08-13 更新**：产品表更正后确认两个 codec 的超时覆盖都位于
+swreg318/319（HEVC 的 G2 表位置 swreg44/45 在产品表中不存在），
+且 golden 抓取给出了厂商实测值 `0x80500000`（OVERRIDE_E=1 +
+周期 5242880）。本驱动现在对两个 codec 都写该值（`TH1520_TIMEOUT_OVERRIDE`），
+外加 2 秒软件看门狗兜底。之前“不写覆盖寄存器”的理由（没有厂商周期值可依）
+已不成立。
 
 ### 6.7 尺寸上限
 

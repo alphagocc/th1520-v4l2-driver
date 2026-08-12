@@ -4,14 +4,21 @@
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 控件到寄存器的映射来自 analysis/vc8000d-register-config/swreg-map-hevc.md
- * （由真实二进制的 HEVC 规格表 @0x4DC5C0 dump 得到）。
+ * 控件到寄存器的映射来自 VC8000D 产品表（product id 0x8001，
+ * 表 @0x4CBB80；位域图 analysis/vc8000d-register-config/swreg-map-vc8000d.md，
+ * 分析与 golden 对照见 analysis/vc8000d-product-table.md）。
+ * G2 表（@0x4DC5C0）的字段位置对 TH1520 无效：产品表中
+ * START_CODE_E=swreg13[31]、INIT_QP=swreg13[30:24]、
+ * OUT_EC_BYPASS=swreg3[8]、LAST_BUFFER_E=swreg3[0]、
+ * tile 计数在 8K 位域 swreg10[23:17]/[16:12]、CLK_GATE_E=swreg2[10]、
+ * 超时看门狗=swreg318/319、AXI ID=swreg60。
  *
  * 语法元素 → 寄存器的对应关系另有上游
  * drivers/media/platform/verisilicon/hantro_g2_hevc_dec.c（GPL-2.0，
  * Copyright (C) 2020 Safran Passenger Innovations LLC，
  * Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4）作交叉验证：
- * 本文件用到的 G2 位域中，上游同名定义与二进制规格表逐位吻合。
+ * 本文件用到的 G2 位域中，上游同名定义与二进制规格表逐位吻合
+ * （且绝大部分与产品表同位置，错位清单见 analysis/vc8000d-product-table.md §3）。
  */
 
 #include <linux/bitops.h>
@@ -195,10 +202,15 @@ static void th1520_hevc_prepare_tile_info(struct th1520_vdec_ctx *ctx)
 	pic_height_in_ctbs = DIV_ROUND_UP(sps->pic_height_in_luma_samples,
 					  1 << max_log2_ctb_size);
 
+	/*
+	 * tile 数量只写 8K 位域（产品表位置 NUM_TILE_COLS_8K[23:17] /
+	 * NUM_TILE_ROWS_8K[16:12]）。旧位域 [23:19]/[18:14] 与 8K 位域重叠，
+	 * .so 先写旧后写新、新值胜出（golden 实测只有 8K 位域被置位），
+	 * 驱动只写 8K 位域，避免重叠位域互相破坏。
+	 */
 	if (!tiles_enabled) {
-		/* 同 INIT_QP：_V0 是与新版重叠的旧修订位域，不能一起写。 */
-		th1520_vdec_reg_write(vpu, &hevc_num_tile_rows, 1);
-		th1520_vdec_reg_write(vpu, &hevc_num_tile_cols, 1);
+		th1520_vdec_reg_write(vpu, &hevc_num_tile_rows_8k, 1);
+		th1520_vdec_reg_write(vpu, &hevc_num_tile_cols_8k, 1);
 
 		/* 只有一个 tile，尺寸等于整幅图像。 */
 		p[0] = pic_width_in_ctbs;
@@ -206,8 +218,8 @@ static void th1520_hevc_prepare_tile_info(struct th1520_vdec_ctx *ctx)
 		return;
 	}
 
-	th1520_vdec_reg_write(vpu, &hevc_num_tile_rows, num_tile_rows);
-	th1520_vdec_reg_write(vpu, &hevc_num_tile_cols, num_tile_cols);
+	th1520_vdec_reg_write(vpu, &hevc_num_tile_rows_8k, num_tile_rows);
+	th1520_vdec_reg_write(vpu, &hevc_num_tile_cols_8k, num_tile_cols);
 
 	if (!uniform_spacing) {
 		unsigned int tmp_w, tmp_h = 0;
@@ -665,24 +677,23 @@ static void th1520_hevc_set_buffers(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_reg_write(vpu, &hevc_strm_buffer_len, src_buf_len);
 	th1520_vdec_reg_write(vpu, &hevc_strm_start_offset, 0);
 	th1520_vdec_reg_write(vpu, &hevc_strm_start_bit, 0);
-	/* 硬件自行搜索 Annex-B 起始码。 */
+	/*
+	 * START_CODE_E（产品表位置 swreg13[31]）= 1：V4L2 的 HEVC_SLICE 缓冲
+	 * 总是带 Annex-B 起始码，硬件自行搜索（golden 实测厂商栈对该码流
+	 * 也是置 1）。之前把这个位写到 G2 表位置 swreg10[31] 是解码失败的
+	 * 直接原因（真实 START_CODE_E=0，硬件把 00 00 01 当 NAL 解析）。
+	 */
 	th1520_vdec_reg_write(vpu, &hevc_start_code_e, 1);
 	/* 必须写 MV，否则后续帧无法做时域预测。 */
 	th1520_vdec_reg_write(vpu, &hevc_write_mvs_e, 1);
 
 	/*
-	 * LAST_BUFFER_E：告诉硬件"整帧数据都在这一个 buffer 里，后面没有了"。
-	 *
-	 * 本驱动一次提交一个完整 AU，不做环形缓冲续流，所以恒为 1。
-	 * 上游 mainline 不写这一位（依赖复位值），但本驱动每帧把影子寄存器清零，
-	 * 任何不显式写的位都会变成 0 —— 若该位复位值为 1，就会被我们错误地清掉，
-	 * 硬件会一直等待后续数据而不产生中断。
-	 *
-	 * BUFFER_EMPTY_INT_E 一并打开：万一硬件仍然认为码流不足，
-	 * 它会产生 DEC_BUFFER_INT 让驱动能报错，而不是静默挂死。
+	 * LAST_BUFFER_E / BUFFER_EMPTY_INT_E（产品表位置 swreg3[0]/[2]）
+	 * 在 common config 里统一按 golden 值写：LAST_BUFFER_E=0（golden 实测，
+	 * 厂商以 STRM_BUFFER_LEN 环形缓冲模型工作）、BUFFER_EMPTY_INT_E=1
+	 * （万一硬件认为码流不足，会产生 DEC_BUFFER_INT 让驱动报错，
+	 * 而不是静默挂死）。
 	 */
-	th1520_vdec_reg_write(vpu, &hevc_last_buffer_e, 1);
-	th1520_vdec_reg_write(vpu, &hevc_buffer_empty_int_e, 1);
 
 	th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_TILE_SIZES,
 				    ctx->hevc.tile_sizes.dma);

@@ -114,70 +114,56 @@ void th1520_vdec_write_addr_pair(struct th1520_vdec_dev *vpu, u16 msb_swreg,
 }
 
 /*
- * AXI burst 长度。
- *   H.264: swreg2[4:0]，.so 与上游 mainline 都写 16。
- *   HEVC : swreg58[7:0]，上游 mainline 写 16。
- * 注意 DWLEnableHw 在启用 L2 cache 时会把 HEVC 的 burst 钳到 16；
+ * AXI burst 长度与总线宽度：产品表中两个 codec 共用 swreg58（见 regs.h），
+ * 厂商栈（SetCommonConfigRegs）两个 codec 都写 MAX_BURST=16、BUSWIDTH=2。
+ * 注意 DWLEnableHw 在启用 L2 cache 时会把 burst 钳到 16；
  * 本驱动不启用 cache/shaper，仍取 16 以与两边一致。
  */
 #define TH1520_MAX_BURST		16
 
 /*
- * G2 的 swap 域语义：4 bit 掩码，0xf 表示对该数据流做完整字节交换，
- * 这是小端主机上的正确取值。
- *
- * 上游 mainline hantro_g2_hevc_dec.c 明确对 g2_strm_swap / g2_dirmv_swap /
- * g2_compress_swap 写 0xf，这三项与本二进制的 DEC_STRM_SWAP /
- * DEC_DIRMV_SWAP / DEC_COMP_TABLE_SWAP 位置完全一致 —— 属已验证。
- *
- * DEC_PIC_SWAP / DEC_TAB0..3_SWAP / DEC_RSCAN_SWAP 在上游是不同修订的
- * 位宽和位置，上游 HEVC 路径根本不写它们；本二进制的
- * SetLegacyG2CommonConfigRegs 会写全部 8 个域。这里按同一小端约定取 0xf。
- *
- * >>> 待硬件验证：若目标板上出现色度平面或 direct-MV 数据字节序错乱，
- *     应首先把下面这个常量改成 0 重新测试。 <<<
+ * 硬件超时看门狗（swreg318/319）：厂商栈对两个 codec 都写
+ * OVERRIDE_E=1 + 周期 5242880（golden 实测 0x80500000；
+ * .so 的 dec_timeout_cycles 全局常量）。
+ * 之前本驱动“不发明周期数”是因为没有厂商值可依；现在有了 golden 实测值，
+ * 直接采用。软件侧另有 2 秒看门狗兜底（TH1520_VDEC_TIMEOUT_MS）。
  */
-#define TH1520_G2_SWAP_LE		0xf
+#define TH1520_TIMEOUT_OVERRIDE		0x80500000U
 
 static void th1520_vdec_common_config_h264(struct th1520_vdec_ctx *ctx)
 {
 	struct th1520_vdec_dev *vpu = ctx->dev;
 
 	/*
-	 * swreg2 —— 总线与字节序。
-	 * 取值同时被两处证据支持：
-	 *  - .so 的 SetLegacyG1CommonConfigRegs 固定值
-	 *    (analysis/vc8000d-register-config/README.md §5)
-	 *  - 上游 hantro_g1_h264_dec.c 启动时写入的 G1_REG_CONFIG
-	 * 两者逐位一致。
+	 * swreg2 —— 产品表布局：四组 swap 域全部为 0，只置 CLK_GATE_E[10]。
+	 * 整字值 0x00000400，与厂商栈 SetCommonConfigRegs 的实测结果一致
+	 * （该函数对两个 codec 写同一套 common config；HEVC 的 golden 抓取
+	 * 证实了 0x400，H.264 走的是同一代码路径）。
+	 * 之前的 G1 表版本（timeout_e/swap32/endian/latency/max_burst 等位）
+	 * 在产品表中不存在，写它们会污染 DIRMV_SWAP 域并把 DRM_E 置 1。
 	 */
-	th1520_vdec_reg_write(vpu, &h264_dec_axi_rd_id, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_timeout_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_strswap32_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_strendian_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_inswap32_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_outswap32_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_data_disc_e, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_out_tiled_e, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_latency, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_clk_gate_e, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_in_endian, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_out_endian, 1);
-	th1520_vdec_reg_write(vpu, &h264_dec_adv_pre_dis, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_scmd_dis, 0);
-	th1520_vdec_reg_write(vpu, &h264_dec_max_burst, TH1520_MAX_BURST);
+	th1520_vdec_reg_write_raw(vpu, 2, 0x00000400);
 
-	/* swreg3 —— 解码模式。本驱动只支持 8 bit H.264（DEC_MODE = 0）。 */
+	/* swreg3 —— 解码模式与图像结构（产品表与 G1 表这些位一致）。 */
 	th1520_vdec_reg_write(vpu, &th1520_dec_mode, TH1520_DEC_MODE_H264);
-	th1520_vdec_reg_write(vpu, &h264_dec_axi_wr_id, 0);
-	/* VLC 模式；本驱动不使用 RLC 模式（swreg9/10/11 保持为参考列表用途）。 */
+	/* VLC 模式；本驱动不使用 RLC 模式。 */
 	th1520_vdec_reg_write(vpu, &h264_rlc_mode_e, 0);
 	/* DEC_OUT_DIS 必须为 0，否则硬件不写输出帧。 */
 	th1520_vdec_reg_write(vpu, &h264_dec_out_dis, 0);
 	th1520_vdec_reg_write(vpu, &h264_filtering_dis, 0);
 	th1520_vdec_reg_write(vpu, &h264_mvc_e, 0);
 
-	/* 错误隐藏起始 MB：不使用。 */
+	/*
+	 * swreg58 —— 总线参数（产品表：MAX_BURST/BUSWIDTH 在这里，不在 swreg2）。
+	 * AXI_RD_ID_E=1 与 golden 一致（DWLEnableHw 在 cache 版本 >4 时置位，
+	 * TH1520 的 golden 抓取证实为 1）。
+	 */
+	th1520_vdec_reg_write(vpu, &h264_max_burst_sw58, TH1520_MAX_BURST);
+	th1520_vdec_reg_write(vpu, &h264_buswidth_sw58, TH1520_BUS_WIDTH_128);
+	th1520_vdec_reg_write(vpu, &h264_axi_rd_id_e_sw58, 1);
+	th1520_vdec_reg_write(vpu, &h264_axi_wd_id_e_sw58, 0);
+
+	/* 错误隐藏：关闭（产品表 swreg48[13:12] ERROR_CONC_MODE=0）。 */
 	th1520_vdec_reg_write_raw(vpu, TH1520_H264_SWREG_ERR_CONC, 0);
 
 	/*
@@ -188,22 +174,15 @@ static void th1520_vdec_common_config_h264(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_reg_write(vpu, &h264_pred_bc_tap_0_1, (u32)(-5) & 0x3ff);
 	th1520_vdec_reg_write(vpu, &h264_pred_bc_tap_0_2, 20);
 
-	/* 参考帧片上缓冲（refbu）：关闭，属于可选加速特性。 */
-	th1520_vdec_reg_write(vpu, &h264_refbu_e, 0);
-	th1520_vdec_reg_write(vpu, &h264_refbu2_buf_e, 0);
+	/* 自适应预取阈值，取上游/厂商同值。 */
 	th1520_vdec_reg_write(vpu, &h264_apf_threshold, 8);
 
-	/* swreg266 —— 错误容忍与 64 bit swap，全部保持默认关闭。 */
+	/* swreg266 —— 忽略 slice 错误：保持关闭。 */
 	th1520_vdec_reg_write(vpu, &h264_ignore_slice_error_e, 0);
-	th1520_vdec_reg_write(vpu, &h264_swap_64bit_r, 0);
-	th1520_vdec_reg_write(vpu, &h264_swap_64bit_w, 0);
 
-	/*
-	 * swreg318/319 的超时周期覆盖：.so 会写 5242880 / 10485760 周期，
-	 * 但上游 mainline 不写，改用 swreg2[23] DEC_TIMEOUT_E 打开硬件默认看门狗。
-	 * 本驱动采用上游做法（不发明周期数），额外由软件看门狗兜底。
-	 * 影子寄存器为 0 意味着 OVERRIDE_E = 0，即“不覆盖硬件默认值”。
-	 */
+	/* swreg318/319 —— 两级硬件超时看门狗，周期取厂商实测值。 */
+	th1520_vdec_reg_write_raw(vpu, 318, TH1520_TIMEOUT_OVERRIDE);
+	th1520_vdec_reg_write_raw(vpu, 319, TH1520_TIMEOUT_OVERRIDE);
 
 	/* 使用中断，而不是轮询。 */
 	th1520_vdec_reg_write(vpu, &th1520_dec_irq_dis, 0);
@@ -214,58 +193,71 @@ static void th1520_vdec_common_config_hevc(struct th1520_vdec_ctx *ctx)
 	struct th1520_vdec_dev *vpu = ctx->dev;
 
 	/*
-	 * swreg2 —— 取自厂商 VCMD 命令缓冲的 golden 值（见 README §6.0.2）。
-	 *
-	 * 实测厂商栈在本硅上写的是 0x00000400，即**所有 swap 域都是 0**，
-	 * 而不是上游 mainline 的 0xf。之前按 mainline 写 0xf 会让硬件
-	 * 报 DEC_ERROR_INT + STRM_CORRUPTED。
-	 *
-	 * 0x400 = bit10。按 G1/legacy 的 swreg2 布局 bit10 是 DEC_CLK_GATE_E，
-	 * 说明 VC8000D（product 0x8001，非 G1 0x6731 / G2 0x6732）很可能
-	 * 对两个 codec 都使用 legacy 布局，而不是 analysis 假定的 8 个 swap 域。
-	 * 待进一步确认前，这里直接写整字。
+	 * swreg2 —— 产品表布局：四组 swap 域全部为 0，只置 CLK_GATE_E[10]，
+	 * 整字 0x00000400。与厂商栈 golden 抓取逐位一致
+	 * （analysis/golden-registers.txt；分析见 analysis/vc8000d-product-table.md）。
 	 */
 	th1520_vdec_reg_write_raw(vpu, 2, 0x00000400);
 
-	/* swreg3 */
+	/* swreg3 —— 产品表布局（G2 表位置在 VC8000D 上无效，见 regs.h）。 */
 	th1520_vdec_reg_write(vpu, &th1520_dec_mode, TH1520_DEC_MODE_HEVC);
-	th1520_vdec_reg_write(vpu, &hevc_comp_table_swap, TH1520_G2_SWAP_LE);
-	/* 不使用参考帧压缩 → 旁路压缩表。 */
+	/*
+	 * OUT_EC_BYPASS=1：旁路参考帧压缩。golden 厂商栈为 0（压缩开 +
+	 * L2CACHE/DEC400 全套配置 + PP 输出）；旁路路径在本驱动早期调试中
+	 * 已证明能写出线性输出（见 README §6.0.1 的实验），而压缩路径需要
+	 * 一整块未验证的 L2CACHE/DEC400 配置。先走旁路，待码流解析跑通后
+	 * 再决定是否切到压缩路径。与 golden 的差异记录在 README §6.0.3。
+	 */
 	th1520_vdec_reg_write(vpu, &hevc_out_ec_bypass, 1);
-	/* 不使用 raster-scan 第二输出。 */
-	th1520_vdec_reg_write(vpu, &hevc_out_rs_e, 0);
+	/* APF_ONE_PID / REF_READ_DIS / L2_SHAPER_E：golden=0/1/0。
+	 * REF_READ_DIS=1 与 golden 的压缩+L2 路径绑定（DWL 层静态配置）；
+	 * 旁路路径保持 0，I 帧无参考读取不受影响。待硬件验证。 */
+	th1520_vdec_reg_write(vpu, &hevc_apf_one_pid, 0);
+	th1520_vdec_reg_write(vpu, &hevc_ref_read_dis, 0);
+	th1520_vdec_reg_write(vpu, &hevc_l2_shaper_e, 0);
+	/* BUFFER_EMPTY_INT_E=1 与 golden 一致；LAST_BUFFER_E 恒 0（golden 实测）。 */
+	th1520_vdec_reg_write(vpu, &hevc_buffer_empty_int_e, 1);
+	th1520_vdec_reg_write(vpu, &hevc_block_buffer_mode_e, 0);
+	th1520_vdec_reg_write(vpu, &hevc_last_buffer_e, 0);
 	/* DEC_OUT_DIS 必须为 0，否则硬件不写输出帧。 */
 	th1520_vdec_reg_write(vpu, &hevc_out_dis, 0);
 
-	/* swreg58/59 —— 总线参数。 */
-	th1520_vdec_reg_write(vpu, &hevc_clk_gate_e, 1);
-	th1520_vdec_reg_write(vpu, &hevc_clk_gate_idle_e, 0);
+	/*
+	 * swreg58 —— 产品表布局：CLK_GATE 不在这里（真实位置 swreg2[10]）。
+	 * AXI_RD_ID_E=1 与 golden 一致；BUSWIDTH=2 / MAX_BURST=16 同厂商。
+	 */
 	th1520_vdec_reg_write(vpu, &hevc_refer_doublebuffer_e, 0);
-	th1520_vdec_reg_write(vpu, &hevc_axi_rd_id_e, 0);
+	th1520_vdec_reg_write(vpu, &hevc_axi_rd_id_e, 1);
 	th1520_vdec_reg_write(vpu, &hevc_axi_wd_id_e, 0);
 	th1520_vdec_reg_write(vpu, &hevc_buswidth, TH1520_BUS_WIDTH_128);
 	th1520_vdec_reg_write(vpu, &hevc_max_burst, TH1520_MAX_BURST);
+
+	/* swreg60 —— AXI ID（产品表位置）。golden 不写（=0）。 */
 	th1520_vdec_reg_write(vpu, &hevc_axi_rd_id, 0);
 	th1520_vdec_reg_write(vpu, &hevc_axi_wr_id, 0);
 
-	/* 自适应预取阈值，取上游同值。 */
+	/* 自适应预取阈值，取上游/厂商同值。 */
 	th1520_vdec_reg_write(vpu, &hevc_apf_disable, 0);
 	th1520_vdec_reg_write(vpu, &hevc_apf_threshold, 8);
 
 	/* 不使用下采样输出。 */
 	th1520_vdec_reg_write(vpu, &hevc_down_scale_e, 0);
 
+	/* swreg318/319 —— 两级硬件超时看门狗，周期取厂商实测值。 */
+	th1520_vdec_reg_write_raw(vpu, 318, TH1520_TIMEOUT_OVERRIDE);
+	th1520_vdec_reg_write_raw(vpu, 319, TH1520_TIMEOUT_OVERRIDE);
+
+	/*
+	 * swreg265（cache/shaper 主使能）不写：旁路路径不配置 cache/shaper。
+	 * 与 golden（0x81004000）的差异记录在 README §6.0.3。
+	 */
+
 	/*
 	 * tile 中断：关闭。本驱动一次提交整帧，只期待一个 DEC_RDY_INT。
 	 * 若将来要走逐 tile 中断循环，需要在 IRQ 里实现
-	 * “清状态 → 重新置 DEC_E”的循环（见 README §7.5）。
+	 * “清状态 → 重新置 DEC_E”的循环（见 README §6.8）。
 	 */
 	th1520_vdec_reg_write(vpu, &th1520_dec_tile_int_e, 0);
-
-	/*
-	 * swreg44/45 的 busbusy / timeout 周期：与 H.264 同理，
-	 * 不发明周期数，保持 TIMEOUT_OVERRIDE_E = 0。
-	 */
 
 	th1520_vdec_reg_write(vpu, &th1520_dec_irq_dis, 0);
 }
@@ -305,10 +297,11 @@ void th1520_vdec_dump_regs(struct th1520_vdec_dev *vpu, const char *why)
 {
 	static const u16 dump_list[] = {
 		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19,
-		20, 44, 45, 46, 47, 48, 49, 55, 58, 59,
+		20, 44, 45, 46, 47, 48, 49, 55, 58, 60,
 		64, 65, 66, 67, 98, 99, 100, 101, 132, 133, 134, 135,
 		166, 167, 168, 169, 170, 171, 178, 179, 180, 181, 182, 183,
-		258, 259, 314,
+		258, 259, 265, 314, 318, 319, 320, 322, 326, 328, 329, 331,
+		332, 394,
 	};
 	unsigned int i;
 

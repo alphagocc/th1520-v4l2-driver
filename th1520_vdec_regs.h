@@ -6,29 +6,34 @@
  *
  * 证据来源（全部为“已验证事实”，除非另行标注）：
  *
- *   analysis/vc8000d-register-config/swreg-map-h264.md   (H.264 / G1, codec id 0x6731)
- *   analysis/vc8000d-register-config/swreg-map-hevc.md   (HEVC  / G2, codec id 0x6732)
+ *   analysis/vc8000d-register-config/swreg-map-vc8000d.md   ← 本文件位域的权威来源
+ *     （VC8000D 产品表 @0x4CBB80，product id 0x8001）
+ *   analysis/vc8000d-product-table.md   （发现过程、golden 字段级解码、驱动差异清单）
+ *   analysis/vc8000d-register-config/swreg-map-h264.md / swreg-map-hevc.md
+ *     （G1 @0x4D40A0 / G2 @0x4DC5C0 codec 表，仅对旧 product 0x6731/0x6732 有效）
  *
- * 这两份表由 analysis/build_swreg_map.py 直接从真实交付二进制
- * libOMX.hantro.VC8000D.video.decoder.so 的寄存器规格表
- * (H264 @0x4D40A0, HEVC @0x4DC5C0) dump 得到：swreg 编号、位宽和 shift
- * 均为二进制中的实测值，不是从参考源码推断的。
+ * ⚠ 2026-08-13 重要更正：早期分析只 dump 了 G1/G2 两张 codec 表，并把产品表
+ * 0x4CBB80 误标为“JPEG 表”。实际运行时 .so 的 SetDecRegister 按
+ * HIWORD(container->regs[0]) 选表（0x6731→G1、0x6732→G2、0x8001→产品表），
+ * 而 container->regs[0] 来自 DWLReadAsicID() —— TH1520 的 HW build id 实测为
+ * 0x80018000（product 0x8001），因此 H.264/HEVC 解码用的都是产品表。
+ * G1/G2 表的字段**位置**对 TH1520 无效；本文件所有位域位置已按产品表重定义。
+ * 关键错位实例（G1/G2 表位置 → 产品表位置）：
+ *   START_CODE_E: H.264 swreg6[31] / HEVC swreg10[31] → 统一 swreg13[31]
+ *   INIT_QP:      H.264 swreg6[25]  / HEVC swreg10[30:24] → 统一 swreg13[30:24]
+ *   LAST_BUFFER_E: swreg3[8] → swreg3[0]；OUT_EC_BYPASS: swreg3[17] → swreg3[8]
+ *   HEVC tile 计数 → 8K 位域 swreg10[23:17]/[16:12]
+ *   CLK_GATE_E（HEVC）: swreg58[16] → swreg2[10]；超时看门狗 → swreg318/319
+ *   H.264 全部地址寄存器 → HEVC 风格统一位置（STREAM@168/169、OUT@64/65、
+ *     REF@66+2i、DIRMV@132/133、QTABLE@174/175）
  *
- * 寄存器名来自 omx_il_g-master/.../8170enum.h，但经过三重独立验证
- * （g1/g2 规格表 LCS 匹配 1739/1742 条、SetCommonConfigRegs 调用序列
- * 逐条同名同序、.rodata 中 17 组 HWIF id 数组逐字节命中），
- * 并与上游 mainline drivers/media/platform/verisilicon/ 的 G1/G2
- * 寄存器定义做了第四重交叉对照。
- *
- * 与上游 mainline 已知不一致、且本文件以“二进制实测值”为准的位域：
- *   - DEC_PIC_SWAP：上游 swreg2 shift22/5bit，本二进制为 swreg2[27:24] 4bit。
- *   - DEC_RSCAN_SWAP：上游在 swreg3[6:2]，本二进制为 swreg2[3:0]。
- *   - DEC_TAB0..3_SWAP：上游为 swreg2/3 的 5bit “old” 变体，
- *     本二进制为 swreg2[19:16]/[15:12]/[11:8]/[7:4] 4bit。
- *   - 中断状态聚合域：上游 g2_dec_int_stat 只覆盖 swreg1[14:11]，
- *     本二进制的 DEC_IRQ_STAT (id 2127) 覆盖 [23:11] 共 13 bit。
- *   - 上游 g2_bit_depth_y/c（shift 21/17）在本二进制的规格表中不存在；
- *     本二进制使用 BIT_DEPTH_Y/C_MINUS8（与上游同名定义一致）。
+ * 三张表均由 analysis/build_swreg_map.py / build_product_map.py 直接从真实
+ * 交付二进制 libOMX.hantro.VC8000D.video.decoder.so 的寄存器规格表 dump 得到：
+ * 每表 2129 条 × 16 字节 = (swreg, 位宽, shift, used)，数值均为二进制实测值。
+ * 寄存器名来自 omx_il_g-master/.../8170enum.h，经多重独立验证
+ * （g1/g2 规格表 LCS 匹配、SetCommonConfigRegs 调用序列、.rodata id 数组、
+ * 上游 mainline hantro 交叉对照），golden 寄存器抓取（analysis/golden-registers.txt）
+ * 提供了 TH1520 上实际值的最终锚点。
  *
  * MMIO 模型：swregN 位于解码核寄存器块偏移 4*N。
  */
@@ -151,28 +156,34 @@ struct th1520_vdec_reg {
 #define TH1520_BUS_WIDTH_128		2
 #define TH1520_BUS_WIDTH_256		3
 
+/*
+ * ========================================================================
+ *  ⚠ 2026-08-13 产品表更正：本文件所有位域位置已按 VC8000D 产品表
+ * （0x4CBB80，product id 0x8001）重定义，不再是 G1/G2 codec 表位置。
+ * TH1520 的 HW build id = 0x80018000，.so 运行时 SetDecRegister 按
+ * HIWORD(regs[0])=0x8001 选中产品表；G1/G2 表只对旧 product 有效。
+ * 证据链与 golden 字段级解码见 analysis/vc8000d-product-table.md，
+ * 完整位域图见 analysis/vc8000d-register-config/swreg-map-vc8000d.md。
+ * ========================================================================
+ */
+
 /* ========================================================================
- *                       H.264 (G1 legacy, DEC_MODE = 0)
+ *                       H.264 (DEC_MODE = 0)
  * ======================================================================== */
 
-/* swreg2 —— 总线与字节序（由 .so 的 SetLegacyG1CommonConfigRegs 写常量） */
-#define h264_dec_axi_rd_id		TH1520_REG(2, 24, 0xff)
-#define h264_dec_timeout_e		TH1520_REG(2, 23, 0x1)
-#define h264_dec_strswap32_e		TH1520_REG(2, 22, 0x1)
-#define h264_dec_strendian_e		TH1520_REG(2, 21, 0x1)
-#define h264_dec_inswap32_e		TH1520_REG(2, 20, 0x1)
-#define h264_dec_outswap32_e		TH1520_REG(2, 19, 0x1)
-#define h264_dec_data_disc_e		TH1520_REG(2, 18, 0x1)
-#define h264_dec_out_tiled_e		TH1520_REG(2, 17, 0x1)
-#define h264_dec_latency		TH1520_REG(2, 11, 0x3f)
+/*
+ * swreg2 —— 产品表布局：
+ *   STRM_SWAP[31:28] / PIC_SWAP[27:24] / DIRMV_SWAP[23:20] / TAB_SWAP[15:12]
+ *   TILED_MODE_MSB[17] / TILED_MODE_LSB[7] / DRM_E[4] / CLK_GATE_E[10]
+ * 厂商栈（SetCommonConfigRegs）四个 swap 域全部写 0，只置 CLK_GATE_E=1，
+ * 整字值 0x00000400 —— 与 HEVC 共用同一个 common config 结果。
+ * G1 表的 STRSWAP32_E / STRENDIAN_E / INSWAP32_E / OUTSWAP32_E /
+ * DATA_DISC_E / DEC_TIMEOUT_E / DEC_LATENCY / DEC_IN_ENDIAN / DEC_OUT_ENDIAN /
+ * DEC_ADV_PRE_DIS / DEC_SCMD_DIS / DEC_MAX_BURST[4:0] 在产品表中均不存在。
+ */
 #define h264_dec_clk_gate_e		TH1520_REG(2, 10, 0x1)
-#define h264_dec_in_endian		TH1520_REG(2, 9, 0x1)
-#define h264_dec_out_endian		TH1520_REG(2, 8, 0x1)
-#define h264_dec_adv_pre_dis		TH1520_REG(2, 6, 0x1)
-#define h264_dec_scmd_dis		TH1520_REG(2, 5, 0x1)
-#define h264_dec_max_burst		TH1520_REG(2, 0, 0x1f)
 
-/* swreg3 —— 解码模式与图像结构 */
+/* swreg3 —— 图像结构（产品表与 G1 表在这些位上一致）。 */
 #define h264_rlc_mode_e			TH1520_REG(3, 24, 0x1)
 #define h264_pic_interlace_e		TH1520_REG(3, 23, 0x1)
 #define h264_pic_fieldmode_e		TH1520_REG(3, 22, 0x1)
@@ -184,30 +195,43 @@ struct th1520_vdec_reg {
 #define h264_reftopfirst_e		TH1520_REG(3, 11, 0x1)
 #define h264_seq_mbaff_e		TH1520_REG(3, 10, 0x1)
 #define h264_picord_count_e		TH1520_REG(3, 9, 0x1)
-#define h264_dec_axi_wr_id		TH1520_REG(3, 0, 0xff)
+/*
+ * G1 表的 DEC_AXI_WR_ID（swreg3[7:0]）在产品表中不存在：产品表 swreg3[7:0]
+ * 是 APF_ONE_PID / REF_READ_DIS / L2_SHAPER_E / BUFFER_EMPTY_INT_E /
+ * BLOCK_BUFFER_MODE_E / LAST_BUFFER_E。AXI ID 在产品表位于 swreg60。
+ */
 
-/* swreg4 —— 图像尺寸与参考帧数 */
+/*
+ * swreg58 —— 产品表中 H.264 与 HEVC 共用（G1 表的 MAX_BURST 在 swreg2[4:0]，
+ * 在 VC8000D 上无效）。
+ */
+#define h264_max_burst_sw58		TH1520_REG(58, 0, 0xff)
+#define h264_buswidth_sw58		TH1520_REG(58, 8, 0x7)
+#define h264_axi_rd_id_e_sw58		TH1520_REG(58, 14, 0x1)
+#define h264_axi_wd_id_e_sw58		TH1520_REG(58, 13, 0x1)
+
+/* swreg4 —— 图像尺寸（单位：宏块）与参考帧数。产品表与 G1 表一致。 */
 #define h264_pic_mb_width		TH1520_REG(4, 23, 0x1ff)
 #define h264_pic_mb_height_p		TH1520_REG(4, 11, 0xff)
 #define h264_ref_frames			TH1520_REG(4, 0, 0x1f)
-/* pic_height_in_mbs > 255 时的高位扩展，位于 swreg7[25] */
+/* pic_height_in_mbs > 255 时的高位扩展，位于 swreg7[25]。 */
 #define h264_pic_mb_h_ext		TH1520_REG(7, 25, 0x1)
 
-/* swreg5 —— 码流起始位与色度 QP 偏移 */
-#define h264_strm_start_bit		TH1520_REG(5, 26, 0x3f)
+/* swreg5 —— 码流起始位与色度 QP 偏移。STRM_START_BIT 产品表为 7 bit。 */
+#define h264_strm_start_bit		TH1520_REG(5, 25, 0x7f)
 #define h264_type1_quant_e		TH1520_REG(5, 24, 0x1)
 #define h264_ch_qp_offset		TH1520_REG(5, 19, 0x1f)
 #define h264_ch_qp_offset2		TH1520_REG(5, 14, 0x1f)
 #define h264_fieldpic_flag_e		TH1520_REG(5, 0, 0x1)
 
-/* swreg6 —— 码流长度与初始 QP。注意 STREAM_LEN 只有 24 bit（16 MiB）。 */
-#define h264_start_code_e		TH1520_REG(6, 31, 0x1)
-#define h264_init_qp			TH1520_REG(6, 25, 0x3f)
-#define h264_ch_8pix_ileav_e		TH1520_REG(6, 24, 0x1)
-#define h264_stream_len			TH1520_REG(6, 0, 0xffffff)
-#define TH1520_H264_MAX_STREAM_LEN	0xffffffU
+/*
+ * swreg6 —— 码流长度。产品表（id 161）为完整 32 bit，H.264 与 HEVC 相同
+ * （G1 表的 24 bit 截断在 VC8000D 上不适用）。
+ * G1 表的 START_CODE_E[31] / INIT_QP[25] 在产品表中位于 swreg13（见下）。
+ */
+#define h264_stream_len			TH1520_REG(6, 0, 0xffffffff)
 
-/* swreg7 —— 熵编码与 frame_num */
+/* swreg7 —— 熵编码与 frame_num。产品表与 G1 表一致。 */
 #define h264_cabac_e			TH1520_REG(7, 31, 0x1)
 #define h264_blackwhite_e		TH1520_REG(7, 30, 0x1)
 #define h264_dir_8x8_infer_e		TH1520_REG(7, 29, 0x1)
@@ -216,7 +240,7 @@ struct th1520_vdec_reg {
 #define h264_framenum_len		TH1520_REG(7, 16, 0x1f)
 #define h264_framenum			TH1520_REG(7, 0, 0xffff)
 
-/* swreg8 —— PPS 标志、参考帧标记语法长度与 IDR */
+/* swreg8 —— PPS 标志、参考帧标记语法长度与 IDR。产品表与 G1 表一致。 */
 #define h264_const_intra_e		TH1520_REG(8, 31, 0x1)
 #define h264_filt_ctrl_pres		TH1520_REG(8, 30, 0x1)
 #define h264_rdpic_cnt_pres		TH1520_REG(8, 29, 0x1)
@@ -225,107 +249,127 @@ struct th1520_vdec_reg {
 #define h264_idr_pic_e			TH1520_REG(8, 16, 0x1)
 #define h264_idr_pic_id			TH1520_REG(8, 0, 0xffff)
 
-/* swreg9 —— PPS id、活动参考索引数与 POC 语法长度 */
+/* swreg9 —— PPS id、活动参考索引数与 POC 语法长度。产品表与 G1 表一致。 */
 #define h264_pps_id			TH1520_REG(9, 24, 0xff)
 #define h264_refidx1_active		TH1520_REG(9, 19, 0x1f)
 #define h264_refidx0_active		TH1520_REG(9, 14, 0x1f)
 #define h264_poc_length			TH1520_REG(9, 0, 0xff)
 
-/* swreg48 —— 错误隐藏起始 MB（上游 G1_REG_ERR_CONC）。本驱动恒写 0。 */
+/*
+ * swreg13 —— 产品表把 START_CODE_E 与 INIT_QP 统一放在这里
+ * （与 HEVC 同位置；G1 表的位置 swreg6[31]/[25] 在 VC8000D 上无效）。
+ */
+#define h264_start_code_e		TH1520_REG(13, 31, 0x1)
+#define h264_init_qp			TH1520_REG(13, 24, 0x7f)
+
+/* swreg48 —— 错误隐藏。产品表 [13:12] ERROR_CONC_MODE，驱动恒写 0（关闭）。 */
 #define TH1520_H264_SWREG_ERR_CONC	48
 
-/* swreg49 —— 亚像素预测滤波器抽头 */
+/* swreg49 —— 亚像素预测滤波器抽头。产品表与 G1 表一致。 */
 #define h264_pred_bc_tap_0_0		TH1520_REG(49, 22, 0x3ff)
 #define h264_pred_bc_tap_0_1		TH1520_REG(49, 12, 0x3ff)
 #define h264_pred_bc_tap_0_2		TH1520_REG(49, 2, 0x3ff)
 
-/* swreg51 / swreg55 —— 参考帧片上缓冲（refbu）。本驱动关闭 refbu。 */
-#define h264_refbu_e			TH1520_REG(51, 31, 0x1)
-#define h264_refbu2_buf_e		TH1520_REG(55, 31, 0x1)
-#define h264_apf_threshold		TH1520_REG(55, 0, 0x3fff)
+/*
+ * swreg55 —— 自适应预取。产品表 APF_THRESHOLD 为 16 bit
+ * （G1 表为 14 bit；取值 8 两者相同）。
+ * G1 表的 REFBU_E（swreg51）/ REFBU2_BUF_E（swreg55[31]）在产品表中不存在。
+ */
+#define h264_apf_threshold		TH1520_REG(55, 0, 0xffff)
 
-/* swreg266 —— 错误容忍与 64bit swap */
+/*
+ * swreg266 —— G1 表的 IGNORE_SLICE_ERROR_E[31] 产品表同位置；
+ * SWAP_64BIT_R/W 在产品表中不存在。
+ */
 #define h264_ignore_slice_error_e	TH1520_REG(266, 31, 0x1)
-#define h264_swap_64bit_r		TH1520_REG(266, 1, 0x1)
-#define h264_swap_64bit_w		TH1520_REG(266, 0, 0x1)
 
-/* swreg314 —— 输出 stride */
+/* swreg314 —— 输出 stride。产品表与 G1 表一致。 */
 #define h264_dec_out_y_stride		TH1520_REG(314, 16, 0xffff)
 #define h264_dec_out_c_stride		TH1520_REG(314, 0, 0xffff)
 
-/* swreg318 / swreg319 —— 两级超时看门狗 */
+/* swreg318 / swreg319 —— 两级超时看门狗（产品表与 G1 表同位置）。 */
 #define h264_ext_timeout_override_e	TH1520_REG(318, 31, 0x1)
 #define h264_ext_timeout_cycles		TH1520_REG(318, 0, 0x7fffffff)
 #define h264_timeout_override_e		TH1520_REG(319, 31, 0x1)
 #define h264_timeout_cycles		TH1520_REG(319, 0, 0x7fffffff)
 
-/* swreg38 / swreg39 —— DPB 长期参考与有效位图（整字） */
+/* swreg38 / swreg39 —— DPB 长期参考与有效位图（整字）。产品表同位置。 */
 #define TH1520_H264_SWREG_LT_REF	38
 #define TH1520_H264_SWREG_VALID_REF	39
 
 /*
- * H.264 地址寄存器。LSB 与 MSB 不相邻，必须成对显式给出。
+ * H.264 地址寄存器 —— 产品表把全部地址 id 统一到 HEVC 风格位置
+ * （G1 表位置 STREAM@12/122、DST@13/123、REF@14+i、QTABLE@40、DIRMV@41
+ * 在 VC8000D 上无效）：
+ *   STREAM_BASE   swreg168/169
+ *   DEC_OUT_BASE  swreg64/65
+ *   REFERi_BASE   swreg66+2i / 67+2i（低 2 bit 复用为 FIELD_E/TOPC_E）
+ *   DIR_MV_BASE   swreg132/133
+ *   QTABLE_BASE   swreg174/175
  * 一律通过 th1520_vdec_write_addr() 写入。
  */
-#define TH1520_H264_ADDR_STREAM_LSB	12
-#define TH1520_H264_ADDR_STREAM_MSB	122
-#define TH1520_H264_ADDR_DST_LSB	13
-#define TH1520_H264_ADDR_DST_MSB	123
-#define TH1520_H264_ADDR_REF_LSB(i)	(14 + (i))
-#define TH1520_H264_ADDR_REF_MSB(i)	(124 + (i))
-#define TH1520_H264_ADDR_QTABLE_LSB	40
-#define TH1520_H264_ADDR_QTABLE_MSB	140
-#define TH1520_H264_ADDR_DIR_MV_LSB	41
-#define TH1520_H264_ADDR_DIR_MV_MSB	141
-#define TH1520_H264_ADDR_CH8PIX_LSB	59
-#define TH1520_H264_ADDR_CH8PIX_MSB	145
+#define TH1520_H264_ADDR_STREAM_LSB	169
+#define TH1520_H264_ADDR_STREAM_MSB	168
+#define TH1520_H264_ADDR_DST_LSB	65
+#define TH1520_H264_ADDR_DST_MSB	64
+#define TH1520_H264_ADDR_REF_LSB(i)	(67 + (i) * 2)
+#define TH1520_H264_ADDR_REF_MSB(i)	(66 + (i) * 2)
+#define TH1520_H264_ADDR_QTABLE_LSB	175
+#define TH1520_H264_ADDR_QTABLE_MSB	174
+#define TH1520_H264_ADDR_DIR_MV_LSB	133
+#define TH1520_H264_ADDR_DIR_MV_MSB	132
 
 /*
  * swreg30..37：每个寄存器放两个参考帧的 frame_num/pic_num。
- * REFER(2n)_NBR 在 [15:0]，REFER(2n+1)_NBR 在 [31:16]。
+ * REFER(2n)_NBR 在 [15:0]，REFER(2n+1)_NBR 在 [31:16]。产品表同位置。
  */
 #define TH1520_H264_SWREG_REF_PIC(i)	(30 + (i))
 #define TH1520_H264_REF_NBR_EVEN(x)	(((x) & 0xffff) << 0)
 #define TH1520_H264_REF_NBR_ODD(x)	(((x) & 0xffff) << 16)
 
 /*
- * 参考列表寄存器（每项 5 bit）：
- *   swreg42..46：B 帧 L0/L1 的第 0..14 项，每 swreg 三组 F/B
+ * 参考列表寄存器（每项 5 bit）。产品表同位置：
+ *   swreg42..46：B 帧 L0/L1 的第 0..14 项（BINIT_RLIST），每 swreg 三组 F/B
  *   swreg47    ：B 帧 L0/L1 的第 15 项 + P 帧 L0 的第 0..3 项
- *   swreg10/11 ：P 帧 L0 的第 4..9 / 10..15 项
- * 与上游 hantro_g1_regs.h 的 G1_REG_BD_REF_PIC / BD_P_REF_PIC / FWD_PIC 完全一致。
+ *   swreg10/11 ：P 帧 L0 的第 4..9 / 10..15 项（PINIT_RLIST_F4..15）
  */
 #define TH1520_H264_SWREG_BD_REF_PIC(i)	(42 + (i))
 #define TH1520_H264_SWREG_BD_P_REF_PIC	47
 #define TH1520_H264_SWREG_FWD_PIC(i)	(10 + (i))
 
 /* ========================================================================
- *                          HEVC (G2, DEC_MODE = 12)
+ *                          HEVC (DEC_MODE = 12)
  * ======================================================================== */
 
-/* swreg2 —— 8 个 4bit swap 域 */
-#define hevc_strm_swap			TH1520_REG(2, 28, 0xf)
-#define hevc_pic_swap			TH1520_REG(2, 24, 0xf)
-#define hevc_dirmv_swap			TH1520_REG(2, 20, 0xf)
-#define hevc_tab0_swap			TH1520_REG(2, 16, 0xf)
-#define hevc_tab1_swap			TH1520_REG(2, 12, 0xf)
-#define hevc_tab2_swap			TH1520_REG(2, 8, 0xf)
-#define hevc_tab3_swap			TH1520_REG(2, 4, 0xf)
-#define hevc_rscan_swap			TH1520_REG(2, 0, 0xf)
+/*
+ * swreg2 —— 产品表布局与 G2 表不同（见上面产品表更正说明）：
+ * 只有 STRM_SWAP[31:28] / PIC_SWAP[27:24] / DIRMV_SWAP[23:20] /
+ * TAB_SWAP[15:12] 四组 swap 域 + TILED_MODE + DRM_E + CLK_GATE_E[10]。
+ * G2 表的 DEC_TAB0..3_SWAP / DEC_RSCAN_SWAP（id 2102-2106）在产品表中
+ * 是 no-op；厂商栈四个 swap 域全写 0、只置 CLK_GATE_E → 整字 0x00000400。
+ */
+#define hevc_clk_gate_e			TH1520_REG(2, 10, 0x1)
 
-/* swreg3 —— 模式与输出控制 */
-#define hevc_comp_table_swap		TH1520_REG(3, 20, 0xf)
-#define hevc_out_ec_bypass		TH1520_REG(3, 17, 0x1)
-#define hevc_out_rs_e			TH1520_REG(3, 16, 0x1)
+/* swreg3 —— 产品表布局（G2 表位置在 VC8000D 上无效，见分析文档 §3）：
+ *   OUT_EC_BYPASS[8] / APF_ONE_PID[7] / REF_READ_DIS[6] / L2_SHAPER_E[5]
+ *   UNNAMED[3]（DWL 的 L2 cache 通道使能）/ BUFFER_EMPTY_INT_E[2]
+ *   BLOCK_BUFFER_MODE_E[1] / LAST_BUFFER_E[0]
+ * G2 表的 COMP_TABLE_SWAP（id 2107）在产品表中是 no-op。
+ */
+#define hevc_out_ec_bypass		TH1520_REG(3, 8, 0x1)
+#define hevc_apf_one_pid		TH1520_REG(3, 7, 0x1)
+#define hevc_ref_read_dis		TH1520_REG(3, 6, 0x1)
+#define hevc_l2_shaper_e		TH1520_REG(3, 5, 0x1)
+#define hevc_buffer_empty_int_e		TH1520_REG(3, 2, 0x1)
+#define hevc_block_buffer_mode_e	TH1520_REG(3, 1, 0x1)
+#define hevc_last_buffer_e		TH1520_REG(3, 0, 0x1)
+
+/* 以下位域产品表与 G2 表同位置 */
 #define hevc_out_dis			TH1520_REG(3, 15, 0x1)
 #define hevc_filtering_dis		TH1520_REG(3, 14, 0x1)
 #define hevc_write_mvs_e		TH1520_REG(3, 12, 0x1)
-#define hevc_apf_one_pid		TH1520_REG(3, 11, 0x1)
-#define hevc_buffer_empty_int_e		TH1520_REG(3, 10, 0x1)
-#define hevc_block_buffer_mode_e	TH1520_REG(3, 9, 0x1)
-#define hevc_last_buffer_e		TH1520_REG(3, 8, 0x1)
 
-/* swreg4 —— 以最小 CB 为单位的图像尺寸 */
+/* swreg4 —— 以最小 CB 为单位的图像尺寸。产品表与 G2 表一致。 */
 #define hevc_pic_width_in_cbs		TH1520_REG(4, 19, 0x1fff)
 #define hevc_pic_height_in_cbs		TH1520_REG(4, 6, 0x1fff)
 #define hevc_num_ref_frames		TH1520_REG(4, 0, 0x1f)
@@ -340,10 +384,10 @@ struct th1520_vdec_reg {
 #define hevc_max_cu_qpd_depth		TH1520_REG(5, 5, 0x3f)
 #define hevc_cu_qpd_e			TH1520_REG(5, 4, 0x1)
 
-/* swreg6 —— HEVC 的 STREAM_LEN 是完整 32 bit（不像 H.264 只有 24 bit） */
+/* swreg6 —— 码流长度（32 bit）。产品表与 G2 表一致。 */
 #define hevc_stream_len			TH1520_REG(6, 0, 0xffffffff)
 
-/* swreg7 —— slice / 滤波参数 */
+/* swreg7 —— slice / 滤波参数。产品表与 G2 表一致。 */
 #define hevc_cabac_init_present		TH1520_REG(7, 31, 0x1)
 #define hevc_blackwhite_e		TH1520_REG(7, 30, 0x1)
 #define hevc_weight_pred_e		TH1520_REG(7, 28, 0x1)
@@ -362,7 +406,9 @@ struct th1520_vdec_reg {
 #define hevc_slice_hdr_ext_e		TH1520_REG(7, 6, 0x1)
 #define hevc_slice_hdr_ebits		TH1520_REG(7, 3, 0x7)
 
-/* swreg8 —— 位深与输出格式 */
+/* swreg8 —— 位深与输出格式。产品表与 G2 表一致
+ * （G2 表的 OUTPUT_8_BITS[3]/OUTPUT_FORMAT[2:0] 在产品表为未命名域，
+ * 本驱动写 0，与 golden 相同）。 */
 #define hevc_const_intra_e		TH1520_REG(8, 31, 0x1)
 #define hevc_filt_ctrl_pres		TH1520_REG(8, 30, 0x1)
 #define hevc_idr_pic_e			TH1520_REG(8, 16, 0x1)
@@ -373,23 +419,24 @@ struct th1520_vdec_reg {
 #define hevc_output_8_bits		TH1520_REG(8, 3, 0x1)
 #define hevc_output_format		TH1520_REG(8, 0, 0x7)
 
-/* swreg9 */
+/* swreg9。产品表与 G2 表一致。 */
 #define hevc_refidx1_active		TH1520_REG(9, 19, 0x1f)
 #define hevc_refidx0_active		TH1520_REG(9, 14, 0x1f)
 #define hevc_hdr_skip_length		TH1520_REG(9, 0, 0x3fff)
 
-/* swreg10 —— 起始码、初始 QP 与 tile 数量。_v0 为旧修订位宽，.so 两套都写。 */
-#define hevc_start_code_e		TH1520_REG(10, 31, 0x1)
-#define hevc_init_qp_v0			TH1520_REG(10, 25, 0x3f)
-#define hevc_init_qp			TH1520_REG(10, 24, 0x7f)
-#define hevc_num_tile_cols_v0		TH1520_REG(10, 20, 0x1f)
-#define hevc_num_tile_cols		TH1520_REG(10, 19, 0x1f)
-#define hevc_num_tile_rows_v0		TH1520_REG(10, 15, 0x1f)
-#define hevc_num_tile_rows		TH1520_REG(10, 14, 0x1f)
+/*
+ * swreg10 —— 产品表布局：tile 数量只写在 8K 位域
+ *   NUM_TILE_COLS_8K[23:17] / NUM_TILE_ROWS_8K[16:12]。
+ * G2 表的 START_CODE_E[31] / INIT_QP[30:24] 在产品表中位于 swreg13；
+ * 旧 tile 位域 [23:19]/[18:14] 与 8K 位域重叠，.so 先写旧后写新、
+ * 新值胜出，驱动只写 8K 位域（golden 实测值 0x21000 即由此而来）。
+ */
+#define hevc_num_tile_cols_8k		TH1520_REG(10, 17, 0x7f)
+#define hevc_num_tile_rows_8k		TH1520_REG(10, 12, 0x1f)
 #define hevc_tile_enable		TH1520_REG(10, 1, 0x1)
 #define hevc_entr_code_synch_e		TH1520_REG(10, 0, 0x1)
 
-/* swreg12 —— 长期参考位图与 CB / PCM 尺寸 */
+/* swreg12 —— 长期参考位图与 CB / PCM 尺寸。产品表与 G2 表一致。 */
 #define hevc_refer_lterm_e		TH1520_REG(12, 16, 0xffff)
 #define hevc_min_cb_size		TH1520_REG(12, 13, 0x7)
 #define hevc_max_cb_size		TH1520_REG(12, 10, 0x7)
@@ -400,7 +447,14 @@ struct th1520_vdec_reg {
 #define hevc_transq_bypass_e		TH1520_REG(12, 1, 0x1)
 #define hevc_refpiclist_mod_e		TH1520_REG(12, 0, 0x1)
 
-/* swreg13 —— 变换树与并行 merge 层级 */
+/*
+ * swreg13 —— 产品表布局：START_CODE_E[31] 与 INIT_QP[30:24] 在这里
+ * （G2 表把它们放在 swreg10，在 VC8000D 上无效；golden 实测
+ * START_CODE_E=1 + INIT_QP=26 出现在 swreg13 高位）。
+ * MIN/MAX_TRB_SIZE、hierdepth、PARALLEL_MERGE 与 G2 表同位置。
+ */
+#define hevc_start_code_e		TH1520_REG(13, 31, 0x1)
+#define hevc_init_qp			TH1520_REG(13, 24, 0x7f)
 #define hevc_min_trb_size		TH1520_REG(13, 13, 0x7)
 #define hevc_max_trb_size		TH1520_REG(13, 10, 0x7)
 #define hevc_max_intra_hierdepth	TH1520_REG(13, 7, 0x7)
@@ -410,38 +464,56 @@ struct th1520_vdec_reg {
 /*
  * swreg14..19 —— 初始参考列表，每项 5 bit。
  * 每个 swreg 存 3 组 (F, B)：F 在 0/10/20，B 在 5/15/25。
- * swreg19 只有第 15 项。
+ * swreg19 只有第 15 项。产品表与 G2 表同位置。
  */
 #define TH1520_HEVC_SWREG_RLIST(i)	(14 + (i))
 
-/* swreg20 —— 非整 CTB 边界与 4x4 单位尺寸 */
+/* swreg20 —— 非整 CTB 边界与 4x4 单位尺寸。产品表与 G2 表一致。 */
 #define hevc_partial_ctb_x		TH1520_REG(20, 31, 0x1)
 #define hevc_partial_ctb_y		TH1520_REG(20, 30, 0x1)
 #define hevc_pic_width_4x4		TH1520_REG(20, 16, 0xfff)
 #define hevc_pic_height_4x4		TH1520_REG(20, 0, 0xfff)
 
-/* swreg44 / swreg45 —— 总线忙与超时看门狗 */
-#define hevc_busbusy_cycles		TH1520_REG(44, 0, 0xffffffff)
-#define hevc_timeout_override_e		TH1520_REG(45, 31, 0x1)
-#define hevc_timeout_cycles		TH1520_REG(45, 0, 0x7fffffff)
+/*
+ * swreg44/45 —— G2 表的 BUSBUSY_CYCLES / TIMEOUT 在产品表中不存在
+ * （id 2114 no-op；超时看门狗在 swreg318/319，与 H.264 共用）。
+ */
+#define hevc_ext_timeout_override_e	TH1520_REG(318, 31, 0x1)
+#define hevc_ext_timeout_cycles		TH1520_REG(318, 0, 0x7fffffff)
+#define hevc_timeout_override_e		TH1520_REG(319, 31, 0x1)
+#define hevc_timeout_cycles		TH1520_REG(319, 0, 0x7fffffff)
 
-/* swreg46..49 —— 16 个参考帧相对当前帧的 POC 差，每项 8 bit */
+/* swreg46..49 —— 16 个参考帧相对当前帧的 POC 差，每项 8 bit。
+ * 产品表与 G2 表同位置。 */
 #define TH1520_HEVC_SWREG_CUR_POC(i)	(46 + (i))
 
-/* swreg55 —— 自适应预取 */
+/* swreg55 —— 自适应预取。产品表与 G2 表一致。 */
 #define hevc_apf_disable		TH1520_REG(55, 31, 0x1)
 #define hevc_apf_threshold		TH1520_REG(55, 0, 0xffff)
 
-/* swreg58 / swreg59 —— 总线参数 */
-#define hevc_clk_gate_idle_e		TH1520_REG(58, 17, 0x1)
-#define hevc_clk_gate_e			TH1520_REG(58, 16, 0x1)
+/*
+ * swreg58 —— 产品表布局：CLK_GATE_E/CLK_GATE_IDLE_E 不在这里
+ * （G2 表位置在产品表中是 MC_POLLTIME 位，真实 CLK_GATE_E = swreg2[10]）。
+ */
 #define hevc_refer_doublebuffer_e	TH1520_REG(58, 15, 0x1)
 #define hevc_axi_rd_id_e		TH1520_REG(58, 14, 0x1)
 #define hevc_axi_wd_id_e		TH1520_REG(58, 13, 0x1)
 #define hevc_buswidth			TH1520_REG(58, 8, 0x7)
 #define hevc_max_burst			TH1520_REG(58, 0, 0xff)
-#define hevc_axi_wr_id			TH1520_REG(59, 16, 0xffff)
-#define hevc_axi_rd_id			TH1520_REG(59, 0, 0xffff)
+
+/* swreg60 —— 产品表的 AXI ID 寄存器（G2 表在 swreg59，位置无效）。 */
+#define hevc_axi_wr_id			TH1520_REG(60, 16, 0xffff)
+#define hevc_axi_rd_id			TH1520_REG(60, 0, 0xffff)
+
+/*
+ * swreg265 —— cache/shaper 控制。产品表字段：
+ *   [31]    cache/shaper 主使能（DWLEnableHw 置位）
+ *   [27:18] / [17:8]  各 10 bit，DWL 缓存配置写入（golden=64/64，语义未明）
+ * 本驱动走 EC_BYPASS 旁路路径，不配置 cache/shaper，该寄存器保持 0。
+ * 若将来启用参考帧压缩（对齐 golden 的 EC_BYPASS=0 + L2CACHE/DEC400），
+ * 需要写 0x81004000 并配置 L2CACHE/DEC400 寄存器块。
+ */
+#define TH1520_SWREG_CACHE_SHAPER_CTRL	265
 
 /* swreg184 —— 下采样输出。本驱动关闭。 */
 #define hevc_down_scale_e		TH1520_REG(184, 7, 0x1)
