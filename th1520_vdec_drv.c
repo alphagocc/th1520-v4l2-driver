@@ -1,21 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * TH1520 VC8000D V4L2 stateless decoder driver — platform glue.
+ * TH1520 VC8000D V4L2 stateless decoder platform support.
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 平台资源（compatible / clock / IRQ / reg）来自厂商内核侧资料
- * reference/vpu-vc8000d-kernel/linux/subsys_driver/{hantro_dec.c,subsys.c}，
- * 详见 driver/README.md 的“平台资源证据”一节。
+ * Framework portions adapted from the Linux Hantro driver:
+ * Copyright (C) 2018 Collabora, Ltd.
+ * Copyright 2018 Google LLC.
+ *     Tomasz Figa <tfiga@chromium.org>
+ * Based on the s5p-mfc driver:
+ * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  *
- * 驱动结构参考上游 drivers/media/platform/verisilicon/hantro_drv.c
- * （Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4，GPL-2.0）。
+ * Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4.
+ * See docs/sources.md for public upstream links and docs/hardware.md for
+ * the platform resources verified on the supported TH1520 board.
  */
 
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -35,10 +40,8 @@
 #include "th1520_vdec.h"
 
 /*
- * 时钟名与使能顺序取自 hantro_dec.c 的 devm_clk_get()/decoder_runtime_resume()：
- *   cclk = 解码核心时钟（同时也是 devfreq 调频对象）
- *   aclk = AXI 总线时钟
- *   pclk = APB 寄存器时钟
+ * Clock names used by the supported TH1520 device tree:
+ * cclk: decoder core; aclk: AXI bus; pclk: APB register interface.
  */
 static const char * const th1520_vdec_clk_names[TH1520_VDEC_NUM_CLOCKS] = {
 	"cclk", "aclk", "pclk",
@@ -55,13 +58,15 @@ void *th1520_vdec_get_ctrl(struct th1520_vdec_ctx *ctx, u32 id)
 dma_addr_t th1520_vdec_get_ref(struct th1520_vdec_ctx *ctx, u64 ts)
 {
 	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	struct th1520_vdec_buffer *capture;
 	struct vb2_buffer *buf;
 
 	buf = vb2_find_buffer(q, ts);
 	if (!buf)
 		return 0;
 
-	return vb2_dma_contig_plane_dma_addr(buf, 0);
+	capture = th1520_vdec_vbuf_to_buffer(to_vb2_v4l2_buffer(buf));
+	return capture->native.cpu ? capture->native.dma : 0;
 }
 
 const struct v4l2_event th1520_vdec_eos_event = {
@@ -96,43 +101,53 @@ static void th1520_vdec_job_finish(struct th1520_vdec_dev *vpu,
 				   struct th1520_vdec_ctx *ctx,
 				   enum vb2_buffer_state result)
 {
+	clk_bulk_disable(TH1520_VDEC_NUM_CLOCKS, vpu->clocks);
 	pm_runtime_mark_last_busy(vpu->dev);
 	pm_runtime_put_autosuspend(vpu->dev);
-
-	clk_bulk_disable(TH1520_VDEC_NUM_CLOCKS, vpu->clocks);
 
 	th1520_vdec_job_finish_no_pm(vpu, ctx, result);
 }
 
 void th1520_vdec_irq_done(struct th1520_vdec_dev *vpu,
+			  struct th1520_vdec_ctx *ctx,
 			  enum vb2_buffer_state result)
 {
-	struct th1520_vdec_ctx *ctx = v4l2_m2m_get_curr_priv(vpu->m2m_dev);
-
-	if (!ctx)
-		return;
-
 	/*
-	 * cancel_delayed_work() 返回 false 表示看门狗已经开跑，
-	 * 由看门狗负责结束这个 job，中断路径不能重复结束。
+	 * The IRQ already claimed this context under irqlock.  A watchdog
+	 * worker may be running, but it cannot claim the same job.  Cancelling
+	 * a pending timer is cleanup, not the decision about who completes it.
 	 */
-	if (cancel_delayed_work(&vpu->watchdog_work)) {
-		if (result == VB2_BUF_STATE_DONE && ctx->codec_ops->done)
-			ctx->codec_ops->done(ctx);
-		th1520_vdec_job_finish(vpu, ctx, result);
-	}
+	cancel_delayed_work(&vpu->watchdog_work);
+	if (result == VB2_BUF_STATE_DONE && ctx->codec_ops->done)
+		ctx->codec_ops->done(ctx);
+	th1520_vdec_job_finish(vpu, ctx, result);
 }
 
 void th1520_vdec_watchdog(struct work_struct *work)
 {
 	struct th1520_vdec_dev *vpu;
 	struct th1520_vdec_ctx *ctx;
+	unsigned long flags, now;
 
 	vpu = container_of(to_delayed_work(work), struct th1520_vdec_dev,
 			   watchdog_work);
-	ctx = v4l2_m2m_get_curr_priv(vpu->m2m_dev);
-	if (!ctx)
+	spin_lock_irqsave(&vpu->irqlock, flags);
+	ctx = vpu->active_ctx;
+	if (!ctx) {
+		spin_unlock_irqrestore(&vpu->irqlock, flags);
 		return;
+	}
+
+	now = jiffies;
+	if (time_before(now, vpu->watchdog_deadline)) {
+		/* An older worker may enter after the next job was armed. */
+		mod_delayed_work(system_wq, &vpu->watchdog_work,
+				 vpu->watchdog_deadline - now);
+		spin_unlock_irqrestore(&vpu->irqlock, flags);
+		return;
+	}
+	vpu->active_ctx = NULL;
+	spin_unlock_irqrestore(&vpu->irqlock, flags);
 
 	dev_err(vpu->dev, "frame processing timed out\n");
 
@@ -162,13 +177,20 @@ void th1520_vdec_start_prepare_run(struct th1520_vdec_ctx *ctx)
 
 void th1520_vdec_end_prepare_run(struct th1520_vdec_ctx *ctx)
 {
+	struct th1520_vdec_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *src_buf = th1520_vdec_get_src_buf(ctx);
+	unsigned long timeout = msecs_to_jiffies(TH1520_VDEC_TIMEOUT_MS);
+	unsigned long flags;
 
 	v4l2_ctrl_request_complete(src_buf->vb2_buf.req_obj.req,
 				   &ctx->ctrl_handler);
 
-	schedule_delayed_work(&ctx->dev->watchdog_work,
-			      msecs_to_jiffies(TH1520_VDEC_TIMEOUT_MS));
+	spin_lock_irqsave(&vpu->irqlock, flags);
+	vpu->active_ctx = ctx;
+	vpu->watchdog_deadline = jiffies + timeout;
+	/* Re-arm even when an earlier invocation is still returning. */
+	mod_delayed_work(system_wq, &vpu->watchdog_work, timeout);
+	spin_unlock_irqrestore(&vpu->irqlock, flags);
 }
 
 static void th1520_vdec_device_run(void *priv)
@@ -335,8 +357,8 @@ static int th1520_vdec_v4l2_init(struct th1520_vdec_dev *vpu)
 
 	vpu->mdev.dev = vpu->dev;
 	strscpy(vpu->mdev.model, TH1520_VDEC_NAME, sizeof(vpu->mdev.model));
-	strscpy(vpu->mdev.bus_info, "platform:" TH1520_VDEC_NAME,
-		sizeof(vpu->mdev.bus_info));
+	snprintf(vpu->mdev.bus_info, sizeof(vpu->mdev.bus_info),
+		 "platform:%s", dev_name(vpu->dev));
 	media_device_init(&vpu->mdev);
 	vpu->mdev.ops = &th1520_vdec_media_ops;
 	vpu->v4l2_dev.mdev = &vpu->mdev;
@@ -413,26 +435,15 @@ static void th1520_vdec_v4l2_cleanup(struct th1520_vdec_dev *vpu)
 /* ---------------------------------------------------------------------- */
 
 /*
- * swreg0 是只读的 HW build id。厂商内核 hantro_dec.c 的 CheckHwId() 用
- *   hw_id = readl(base) >> 16
- * 判定核类型：
- *   IS_G1(0x6731) / IS_G2(0x6732) / IS_VC8000D(0x8001)
- * TH1520 上的解码核应当读出 0x8001。
- *
- * 这是一次纯读操作，不会启动硬件；它同时验证了 reg + 0x1000 的映射是否正确。
+ * The upper half of the read-only ASIC identifier selects product 0x8001.
+ * The separate build identifier is read from register 309.
  */
 #define TH1520_VDEC_HW_ID_VC8000D	0x8001
 
 /*
- * VPU 子系统里的 Hantro MMU 块（子系统基址 + 0x3000）。
- * 寄存器编号取自 reference/vpu-vc8000d-kernel/linux/subsys_driver/hantro_mmu.c：
- *   MMU_REG_HW_ID   = 6*4
- *   MMU_REG_CONTROL = 226*4   （写 1 使能，写 0 关闭）
- *
- * 厂商 hantrodec 的 probe 会调用 MMUInit() + MMUEnable()，也就是说开机后
- * MMU 可能处于**已使能**状态。本驱动用的是 CMA 物理地址、不建页表，
- * 因此 MMU 必须处于旁路（关闭）状态，否则硬件会把物理地址当虚拟地址翻译，
- * 取到的码流和写出的帧全是错的。
+ * The subsystem MMU starts at offset 0x3000. Its identifier is at word 6
+ * and its enable bit is at word 226. This driver uses physical DMA
+ * addresses, so the MMU must remain disabled while decoding.
  */
 #define TH1520_VDEC_MMU_OFFSET		0x3000
 #define TH1520_VDEC_MMU_IOSIZE		(229 * 4)
@@ -474,7 +485,7 @@ static void th1520_vdec_bypass_mmu(struct th1520_vdec_dev *vpu,
 static int th1520_vdec_probe_hw(struct th1520_vdec_dev *vpu,
 				struct resource *res)
 {
-	u32 hw_id;
+	u32 hw_id, build_id;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(vpu->dev);
@@ -488,19 +499,27 @@ static int th1520_vdec_probe_hw(struct th1520_vdec_dev *vpu,
 	}
 
 	hw_id = vdpu_read(vpu, TH1520_VDEC_REG_OFF(TH1520_VDEC_SWREG_ID));
+	/*
+	 * Register 309 contains the hardware build identifier.
+	 */
+	build_id = vdpu_read(vpu, TH1520_VDEC_REG_OFF(309));
 	th1520_vdec_bypass_mmu(vpu, res);
 
 	clk_bulk_disable(TH1520_VDEC_NUM_CLOCKS, vpu->clocks);
 	pm_runtime_mark_last_busy(vpu->dev);
 	pm_runtime_put_autosuspend(vpu->dev);
 
-	dev_info(vpu->dev, "HW build id 0x%08x (product 0x%04x)\n",
-		 hw_id, hw_id >> 16);
+	dev_info(vpu->dev, "ASIC id 0x%08x (product 0x%04x), build id 0x%08x\n",
+		 hw_id, hw_id >> 16, build_id);
 
 	if ((hw_id >> 16) != TH1520_VDEC_HW_ID_VC8000D) {
 		dev_err(vpu->dev,
 			"unexpected product id 0x%04x, expected 0x%04x — check reg mapping\n",
 			hw_id >> 16, TH1520_VDEC_HW_ID_VC8000D);
+		return -ENODEV;
+	}
+	if (build_id != 0x1f88) {
+		dev_err(vpu->dev, "unsupported VC8000D build id 0x%08x\n", build_id);
 		return -ENODEV;
 	}
 
@@ -525,12 +544,9 @@ static int th1520_vdec_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, vpu);
 
 	/*
-	 * 地址位宽：H.264 表里 RLC_VLC_BASE_MSB(swreg122) 存在，
-	 * 但二进制中 H264RunAsic 有断言“非 High10 模式下 regs[122] 必须为 0”，
-	 * 即 8bit H.264 路径要求码流地址落在 4 GiB 以内。
-	 * 在目标板上确认 MSB 寄存器行为之前，这里保守地把 DMA 掩码限制成 32 bit，
-	 * 同时驱动仍然显式写 MSB 寄存器（值为 0）。
-	 * 放开到 64 bit 属于 README 中的“待硬件验证”项。
+	 * The validated configuration uses 32-bit DMA addresses. Address-pair
+	 * upper words are still written explicitly. Wider DMA addressing requires
+	 * separate hardware validation.
 	 */
 	ret = dma_set_mask_and_coherent(vpu->dev, DMA_BIT_MASK(32));
 	if (ret) {
@@ -539,15 +555,9 @@ static int th1520_vdec_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * DT 的 reg 是 **VPU 子系统基址**（板上实测：vdec@ffecc00000，
-	 * reg = <0xff 0xecc00000 0x0 0x800000>，8 MiB 窗口），
-	 * VC8000D 解码核在子系统基址 + 0x1000，窗口 1023*4 字节。
-	 * 该布局来自 reference/vpu-vc8000d-kernel/linux/subsys_driver/subsys.c
-	 * 的 core_array[]，并已在 RevyOS 6.6.119-th1520 的实际 DT 上确认。
-	 *
-	 * 这里只映射解码核本身，不 request 整个 8 MiB 子系统窗口：
-	 * 子系统里还有 VCMD / L2CACHE / MMU / DEC400 等其它块，
-	 * 本驱动一概不碰。
+	 * The device-tree resource describes the VPU subsystem. Map the decoder
+	 * window at offset 0x1000; the MMU is mapped separately for bypass control.
+	 * The supported resource layout is documented in docs/hardware.md.
 	 */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
@@ -640,20 +650,9 @@ static const struct dev_pm_ops th1520_vdec_pm_ops = {
 };
 
 /*
- * compatible 取自 hantro_dec.c 的 isp_of_match[]，并在目标板上确认：
- * RevyOS 6.6.119-th1520 的 DT 节点为
- *   vdec@ffecc00000 { compatible = "xuantie,th1520-vc8000d";
- *                     reg = <0xff 0xecc00000 0x0 0x800000>;
- *                     interrupts = <131 4>;
- *                     clock-names = "aclk", "cclk", "pclk"; ... };
- *
- * 本驱动直接绑定该节点，因此**不需要修改设备树**，但必须先阻止厂商模块
- * 抢占同一个设备（板上默认加载了 hantrodec.ko 与 vc8000.ko）：
- *
- *   echo 'blacklist hantrodec' | sudo tee /etc/modprobe.d/th1520-vdec.conf
- *   echo 'blacklist vc8000'   | sudo tee -a /etc/modprobe.d/th1520-vdec.conf
- *
- * 或调试期间先 rmmod 再手动 bind。
+ * Bind the existing TH1520 decoder node. Only one decoder driver may own
+ * the device at a time; tools/board-load.sh performs temporary switching.
+ * The encoder is a separate device.
  */
 static const struct of_device_id th1520_vdec_of_match[] = {
 	{ .compatible = "xuantie,th1520-vc8000d" },
@@ -680,6 +679,8 @@ static struct platform_driver th1520_vdec_driver = {
 		.name = TH1520_VDEC_NAME,
 		.of_match_table = th1520_vdec_of_match,
 		.pm = &th1520_vdec_pm_ops,
+		/* An open video fd pins this module; omit unsafe manual unbind. */
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(th1520_vdec_driver);

@@ -1,24 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * TH1520 VC8000D — HEVC (G2, DEC_MODE = 12) stateless 后端。
+ * TH1520 VC8000D HEVC stateless decoding, hardware mode 12.
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 控件到寄存器的映射来自 VC8000D 产品表（product id 0x8001，
- * 表 @0x4CBB80；位域图 analysis/vc8000d-register-config/swreg-map-vc8000d.md，
- * 分析与 golden 对照见 analysis/vc8000d-product-table.md）。
- * G2 表（@0x4DC5C0）的字段位置对 TH1520 无效：产品表中
- * START_CODE_E=swreg13[31]、INIT_QP=swreg13[30:24]、
- * OUT_EC_BYPASS=swreg3[8]、LAST_BUFFER_E=swreg3[0]、
- * tile 计数在 8K 位域 swreg10[23:17]/[16:12]、CLK_GATE_E=swreg2[10]、
- * 超时看门狗=swreg318/319、AXI ID=swreg60。
+ * Tile and scaling-list handling adapted from Linux hantro_hevc.c and
+ * hantro_g2_hevc_dec.c:
+ * Copyright (C) 2020 Safran Passenger Innovations LLC
  *
- * 语法元素 → 寄存器的对应关系另有上游
- * drivers/media/platform/verisilicon/hantro_g2_hevc_dec.c（GPL-2.0，
- * Copyright (C) 2020 Safran Passenger Innovations LLC，
- * Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4）作交叉验证：
- * 本文件用到的 G2 位域中，上游同名定义与二进制规格表逐位吻合
- * （且绝大部分与产品表同位置，错位清单见 analysis/vc8000d-product-table.md §3）。
+ * Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4.
+ * See docs/sources.md for public upstream links. TH1520 uses its own
+ * register placement and native buffers as documented in docs/hardware.md.
  */
 
 #include <linux/bitops.h>
@@ -44,60 +36,19 @@
 
 /* ---------------------------------------------------------------------- */
 
-static void th1520_hevc_ref_init(struct th1520_vdec_ctx *ctx)
-{
-	ctx->hevc.ref_bufs_used = 0;
-}
-
-static dma_addr_t th1520_hevc_get_ref_buf(struct th1520_vdec_ctx *ctx, s32 poc)
-{
-	struct th1520_vdec_hevc_ctx *hevc = &ctx->hevc;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(hevc->ref_bufs); i++) {
-		if (hevc->ref_bufs_poc[i] == poc) {
-			hevc->ref_bufs_used |= BIT(i);
-			return hevc->ref_bufs[i];
-		}
-	}
-
-	return 0;
-}
-
-static int th1520_hevc_add_ref_buf(struct th1520_vdec_ctx *ctx, s32 poc,
-				   dma_addr_t addr)
-{
-	struct th1520_vdec_hevc_ctx *hevc = &ctx->hevc;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(hevc->ref_bufs); i++) {
-		if (!(hevc->ref_bufs_used & BIT(i))) {
-			hevc->ref_bufs_used |= BIT(i);
-			hevc->ref_bufs_poc[i] = poc;
-			hevc->ref_bufs[i] = addr;
-			return 0;
-		}
-	}
-
-	return -EINVAL;
-}
-
-/*
- * CAPTURE buffer 内部布局（与 th1520_vdec_fill_pixfmt_cap() 保持一致）：
- *
- *   +0                       luma (Y)
- *   +chroma_offset           chroma (interleaved CbCr)
- *   +mv_offset               direct-MV (colocated) 缓冲
+/* The Request API identifies references by CAPTURE timestamps, not POC.
+ * Keep the tiled decode surface separate from the linear PP output.
  */
-static size_t th1520_hevc_chroma_offset(struct th1520_vdec_ctx *ctx)
+static dma_addr_t th1520_hevc_get_ref_buf(struct th1520_vdec_ctx *ctx, u64 ts)
 {
-	return ctx->dst_fmt.plane_fmt[0].bytesperline *
-	       ALIGN(ctx->dst_fmt.height, TH1520_MB_DIM);
-}
+	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	struct th1520_vdec_buffer *buf;
+	struct vb2_buffer *vb = vb2_find_buffer(q, ts);
 
-static size_t th1520_hevc_mv_offset(struct th1520_vdec_ctx *ctx)
-{
-	return ALIGN(th1520_hevc_chroma_offset(ctx) * 3 / 2, 16);
+	if (!vb)
+		return 0;
+	buf = th1520_vdec_vbuf_to_buffer(to_vb2_v4l2_buffer(vb));
+	return buf->native.cpu ? buf->native.dma : 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -107,68 +58,54 @@ static int th1520_hevc_tile_buffers_realloc(struct th1520_vdec_ctx *ctx)
 	struct th1520_vdec_dev *vpu = ctx->dev;
 	struct th1520_vdec_hevc_ctx *hevc = &ctx->hevc;
 	const struct v4l2_ctrl_hevc_pps *pps = hevc->ctrls.pps;
-	const struct v4l2_ctrl_hevc_sps *sps = hevc->ctrls.sps;
+	struct th1520_vdec_aux_buf filter = { 0 };
+	struct th1520_vdec_aux_buf sao = { 0 };
+	struct th1520_vdec_aux_buf bsd = { 0 };
 	unsigned int num_tile_cols = pps->num_tile_columns_minus1 + 1;
-	unsigned int height64 = ALIGN(sps->pic_height_in_luma_samples, 64);
-	unsigned int size;
+	unsigned int height64 = ALIGN(ctx->src_fmt.height, 64);
 
 	if (num_tile_cols <= 1 ||
 	    num_tile_cols <= hevc->num_tile_cols_allocated)
 		return 0;
 
-	if (hevc->tile_filter.cpu) {
+	/* Keep the previous allocation usable if any replacement fails. */
+	filter.size = (VERT_FILTER_RAM_SIZE * height64 * (num_tile_cols - 1) *
+		       ctx->bit_depth) / 8;
+	filter.cpu = dma_alloc_coherent(vpu->dev, filter.size, &filter.dma,
+				       GFP_KERNEL);
+	if (!filter.cpu)
+		return -ENOMEM;
+
+	sao.size = (VERT_SAO_RAM_SIZE * height64 * (num_tile_cols - 1) *
+		    ctx->bit_depth) / 8;
+	sao.cpu = dma_alloc_coherent(vpu->dev, sao.size, &sao.dma, GFP_KERNEL);
+	if (!sao.cpu)
+		goto err_free_filter;
+
+	bsd.size = BSD_CTRL_RAM_SIZE * height64 * (num_tile_cols - 1);
+	bsd.cpu = dma_alloc_coherent(vpu->dev, bsd.size, &bsd.dma, GFP_KERNEL);
+	if (!bsd.cpu)
+		goto err_free_sao;
+
+	if (hevc->tile_filter.cpu)
 		dma_free_coherent(vpu->dev, hevc->tile_filter.size,
 				  hevc->tile_filter.cpu, hevc->tile_filter.dma);
-		hevc->tile_filter.cpu = NULL;
-	}
-	if (hevc->tile_sao.cpu) {
+	if (hevc->tile_sao.cpu)
 		dma_free_coherent(vpu->dev, hevc->tile_sao.size,
 				  hevc->tile_sao.cpu, hevc->tile_sao.dma);
-		hevc->tile_sao.cpu = NULL;
-	}
-	if (hevc->tile_bsd.cpu) {
+	if (hevc->tile_bsd.cpu)
 		dma_free_coherent(vpu->dev, hevc->tile_bsd.size,
 				  hevc->tile_bsd.cpu, hevc->tile_bsd.dma);
-		hevc->tile_bsd.cpu = NULL;
-	}
-
-	size = (VERT_FILTER_RAM_SIZE * height64 * (num_tile_cols - 1) *
-		ctx->bit_depth) / 8;
-	hevc->tile_filter.cpu = dma_alloc_coherent(vpu->dev, size,
-						   &hevc->tile_filter.dma,
-						   GFP_KERNEL);
-	if (!hevc->tile_filter.cpu)
-		return -ENOMEM;
-	hevc->tile_filter.size = size;
-
-	size = (VERT_SAO_RAM_SIZE * height64 * (num_tile_cols - 1) *
-		ctx->bit_depth) / 8;
-	hevc->tile_sao.cpu = dma_alloc_coherent(vpu->dev, size,
-						&hevc->tile_sao.dma,
-						GFP_KERNEL);
-	if (!hevc->tile_sao.cpu)
-		goto err_free_filter;
-	hevc->tile_sao.size = size;
-
-	size = BSD_CTRL_RAM_SIZE * height64 * (num_tile_cols - 1);
-	hevc->tile_bsd.cpu = dma_alloc_coherent(vpu->dev, size,
-						&hevc->tile_bsd.dma,
-						GFP_KERNEL);
-	if (!hevc->tile_bsd.cpu)
-		goto err_free_sao;
-	hevc->tile_bsd.size = size;
-
+	hevc->tile_filter = filter;
+	hevc->tile_sao = sao;
+	hevc->tile_bsd = bsd;
 	hevc->num_tile_cols_allocated = num_tile_cols;
 	return 0;
 
 err_free_sao:
-	dma_free_coherent(vpu->dev, hevc->tile_sao.size, hevc->tile_sao.cpu,
-			  hevc->tile_sao.dma);
-	hevc->tile_sao.cpu = NULL;
+	dma_free_coherent(vpu->dev, sao.size, sao.cpu, sao.dma);
 err_free_filter:
-	dma_free_coherent(vpu->dev, hevc->tile_filter.size,
-			  hevc->tile_filter.cpu, hevc->tile_filter.dma);
-	hevc->tile_filter.cpu = NULL;
+	dma_free_coherent(vpu->dev, filter.size, filter.cpu, filter.dma);
 	return -ENOMEM;
 }
 
@@ -203,10 +140,8 @@ static void th1520_hevc_prepare_tile_info(struct th1520_vdec_ctx *ctx)
 					  1 << max_log2_ctb_size);
 
 	/*
-	 * tile 数量只写 8K 位域（产品表位置 NUM_TILE_COLS_8K[23:17] /
-	 * NUM_TILE_ROWS_8K[16:12]）。旧位域 [23:19]/[18:14] 与 8K 位域重叠，
-	 * .so 先写旧后写新、新值胜出（golden 实测只有 8K 位域被置位），
-	 * 驱动只写 8K 位域，避免重叠位域互相破坏。
+	 * Tile columns occupy register 10 bits 23:17 and rows bits 16:12.
+	 * Use only these fields to avoid overlapping encodings from other cores.
 	 */
 	if (!tiles_enabled) {
 		th1520_vdec_reg_write(vpu, &hevc_num_tile_rows_8k, 1);
@@ -395,19 +330,19 @@ static void th1520_hevc_set_params(struct th1520_vdec_ctx *ctx)
 			      pps->pps_tc_offset_div2);
 	th1520_vdec_reg_write(vpu, &hevc_slice_hdr_ext_e,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT));
-	th1520_vdec_reg_write(vpu, &hevc_slice_hdr_ebits,
+	th1520_vdec_reg_write(vpu, &hevc_slice_header_extra_bits,
 			      pps->num_extra_slice_header_bits);
-	th1520_vdec_reg_write(vpu, &hevc_slice_chqp_flag,
+	th1520_vdec_reg_write(vpu, &hevc_slice_chroma_qp_offsets_present,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT));
 	th1520_vdec_reg_write(vpu, &hevc_weight_pred_e,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED));
 	th1520_vdec_reg_write(vpu, &hevc_weight_bipr_idc,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED));
-	th1520_vdec_reg_write(vpu, &hevc_depend_slice_e,
+	th1520_vdec_reg_write(vpu, &hevc_dependent_segments_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED));
-	th1520_vdec_reg_write(vpu, &hevc_filt_override_e,
+	th1520_vdec_reg_write(vpu, &hevc_deblocking_override_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_OVERRIDE_ENABLED));
-	th1520_vdec_reg_write(vpu, &hevc_pcm_filt_disable,
+	th1520_vdec_reg_write(vpu, &hevc_pcm_loop_filter_disabled,
 			      !!(sps->flags & V4L2_HEVC_SPS_FLAG_PCM_LOOP_FILTER_DISABLED));
 	th1520_vdec_reg_write(vpu, &hevc_cabac_init_present,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_CABAC_INIT_PRESENT));
@@ -415,11 +350,11 @@ static void th1520_hevc_set_params(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_reg_write(vpu, &hevc_blackwhite_e, 0);
 
 	/* swreg12 —— CB / PCM / 变换标志 */
-	th1520_vdec_reg_write(vpu, &hevc_transform_skip_e,
+	th1520_vdec_reg_write(vpu, &hevc_transform_skip_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_TRANSFORM_SKIP_ENABLED));
-	th1520_vdec_reg_write(vpu, &hevc_transq_bypass_e,
+	th1520_vdec_reg_write(vpu, &hevc_transquant_bypass_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_TRANSQUANT_BYPASS_ENABLED));
-	th1520_vdec_reg_write(vpu, &hevc_refpiclist_mod_e,
+	th1520_vdec_reg_write(vpu, &hevc_reference_list_modification_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_LISTS_MODIFICATION_PRESENT));
 	th1520_vdec_reg_write(vpu, &hevc_pcm_e,
 			      !!(sps->flags & V4L2_HEVC_SPS_FLAG_PCM_ENABLED));
@@ -429,9 +364,9 @@ static void th1520_hevc_set_params(struct th1520_vdec_ctx *ctx)
 				      sps->log2_min_pcm_luma_coding_block_size_minus3 + 3);
 		th1520_vdec_reg_write(vpu, &hevc_min_pcm_size,
 				      sps->log2_min_pcm_luma_coding_block_size_minus3 + 3);
-		th1520_vdec_reg_write(vpu, &hevc_pcm_bitdepth_y,
+		th1520_vdec_reg_write(vpu, &hevc_pcm_luma_sample_depth,
 				      sps->pcm_sample_bit_depth_luma_minus1 + 1);
-		th1520_vdec_reg_write(vpu, &hevc_pcm_bitdepth_c,
+		th1520_vdec_reg_write(vpu, &hevc_pcm_chroma_sample_depth,
 				      sps->pcm_sample_bit_depth_chroma_minus1 + 1);
 	}
 
@@ -445,20 +380,10 @@ static void th1520_hevc_set_params(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_reg_write(vpu, &hevc_filtering_dis,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_PPS_DISABLE_DEBLOCKING_FILTER));
 
-	th1520_vdec_reg_write(vpu, &hevc_entr_code_synch_e,
+	th1520_vdec_reg_write(vpu, &hevc_entropy_row_sync_enabled,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_ENTROPY_CODING_SYNC_ENABLED));
 	/*
-	 * 只写新版（7 bit）INIT_QP。
-	 *
-	 * 规格表里 swreg10 同时存在旧修订的窄位域 INIT_QP_V0[30:25]，
-	 * 它与 INIT_QP[30:24] **重叠**。.so 之所以两套都写，是为了兼容不同
-	 * HW 修订，但那依赖特定的写入顺序 —— 两个都写等于把值破坏掉。
-	 *
-	 * 目标板实测：product id = 0x8001（新版 VC8000D），
-	 * 且 INIT_QP[30:24] 与上游 mainline 的 g2_init_qp（shift 24, mask 0x7f）
-	 * 定义一致。因此这里只写新版位域。
-	 *
-	 * （曾经两个都写，导致 QP 26 被写成 52，见 README §6.0 的调试记录。）
+	 * The initial QP occupies register 13 bits 30:24 on this hardware.
 	 */
 	th1520_vdec_reg_write(vpu, &hevc_init_qp, pps->init_qp_minus26 + 26);
 
@@ -491,7 +416,7 @@ static void th1520_hevc_write_rlist(struct th1520_vdec_dev *vpu,
 static u32 th1520_hevc_dpb_index(const struct v4l2_ctrl_hevc_decode_params *dec,
 				 u32 index)
 {
-	if (index > dec->num_active_dpb_entries)
+	if (index >= dec->num_active_dpb_entries)
 		return 0;
 
 	return index;
@@ -553,8 +478,9 @@ static int th1520_hevc_set_ref(struct th1520_vdec_ctx *ctx)
 	const struct v4l2_ctrl_hevc_decode_params *dec = ctrls->decode_params;
 	const struct v4l2_hevc_dpb_entry *dpb = dec->dpb;
 	struct th1520_vdec_dev *vpu = ctx->dev;
-	size_t cr_offset = th1520_hevc_chroma_offset(ctx);
-	size_t mv_offset = th1520_hevc_mv_offset(ctx);
+	size_t cr_offset = th1520_vdec_hevc_native_chroma_offset(ctx);
+	size_t mv_offset = th1520_vdec_hevc_native_mv_offset(ctx);
+	struct th1520_vdec_buffer *dst;
 	struct vb2_v4l2_buffer *vb2_dst;
 	dma_addr_t luma_addr, chroma_addr, mv_addr;
 	u32 max_ref_frames;
@@ -570,18 +496,22 @@ static int th1520_hevc_set_ref(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_reg_write(vpu, &hevc_num_ref_frames,
 			      max_ref_frames ? max_ref_frames : 1);
 
-	th1520_vdec_reg_write(vpu, &hevc_filt_slice_border,
+	th1520_vdec_reg_write(vpu, &hevc_loop_filter_across_slices,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_PPS_LOOP_FILTER_ACROSS_SLICES_ENABLED));
-	th1520_vdec_reg_write(vpu, &hevc_filt_tile_border,
+	th1520_vdec_reg_write(vpu, &hevc_loop_filter_across_tiles,
 			      !!(pps->flags & V4L2_HEVC_PPS_FLAG_LOOP_FILTER_ACROSS_TILES_ENABLED));
 
 	/* 写各参考帧与当前帧的 POC 差 */
 	for (i = 0; i < dec->num_active_dpb_entries &&
 	     i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
-		s8 poc_diff = dec->pic_order_cnt_val -
-			      dpb[i].pic_order_cnt_val;
+		s64 poc_diff = (s64)dec->pic_order_cnt_val -
+			       dpb[i].pic_order_cnt_val;
 
-		th1520_hevc_write_cur_poc(vpu, i, (u8)poc_diff);
+		/*
+		 * The signed 8-bit POC-difference fields require saturation before packing.
+		 */
+		th1520_hevc_write_cur_poc(vpu, i,
+					 (u8)clamp_t(s64, poc_diff, -128, 127));
 	}
 	/* 紧跟参考帧之后放一项指向自身（差为 0） */
 	if (i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
@@ -592,13 +522,10 @@ static int th1520_hevc_set_ref(struct th1520_vdec_ctx *ctx)
 
 	th1520_hevc_set_ref_pic_list(ctx);
 
-	/* 只保留仍在使用的参考帧记录 */
-	th1520_hevc_ref_init(ctx);
-
 	for (i = 0; i < dec->num_active_dpb_entries &&
 	     i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX - 1; i++) {
 		luma_addr = th1520_hevc_get_ref_buf(ctx,
-						    dpb[i].pic_order_cnt_val);
+						    dpb[i].timestamp);
 		if (!luma_addr)
 			return -ENOENT;
 
@@ -615,12 +542,14 @@ static int th1520_hevc_set_ref(struct th1520_vdec_ctx *ctx)
 	}
 
 	vb2_dst = th1520_vdec_get_dst_buf(ctx);
-	luma_addr = vb2_dma_contig_plane_dma_addr(&vb2_dst->vb2_buf, 0);
-	if (!luma_addr)
+	dst = th1520_vdec_vbuf_to_buffer(vb2_dst);
+	if (!dst->native.cpu)
 		return -EFAULT;
-
-	if (th1520_hevc_add_ref_buf(ctx, dec->pic_order_cnt_val, luma_addr))
-		return -EINVAL;
+	luma_addr = dst->native.dma;
+	/*
+	 * Clear the 32-byte picture synchronization area before buffer reuse.
+	 */
+	memset((u8 *)dst->native.cpu + mv_offset - 32, 0, 32);
 
 	chroma_addr = luma_addr + cr_offset;
 	mv_addr = luma_addr + mv_offset;
@@ -639,7 +568,12 @@ static int th1520_hevc_set_ref(struct th1520_vdec_ctx *ctx)
 				    chroma_addr);
 	th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_OUT_MV, mv_addr);
 
-	/* 影子寄存器已清零，剩余槽位天然为 0，无需再显式写。 */
+	/* Clear unused slots in hardware as well when sparse flushing is used. */
+	for (; i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
+		th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_REF_LUMA(i), 0);
+		th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_REF_CHROMA(i), 0);
+		th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_REF_MV(i), 0);
+	}
 
 	th1520_vdec_reg_write(vpu, &hevc_refer_lterm_e, dpb_longterm);
 
@@ -651,11 +585,15 @@ static void th1520_hevc_set_buffers(struct th1520_vdec_ctx *ctx)
 	struct th1520_vdec_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *src_buf = th1520_vdec_get_src_buf(ctx);
 	dma_addr_t src_dma;
-	u32 src_len, src_buf_len;
+	u32 src_len, src_buf_len, data_offset, start_byte;
 
 	src_dma = vb2_dma_contig_plane_dma_addr(&src_buf->vb2_buf, 0);
-	src_len = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
-	src_buf_len = vb2_plane_size(&src_buf->vb2_buf, 0);
+	data_offset = src_buf->vb2_buf.planes[0].data_offset;
+	src_dma += data_offset;
+	start_byte = src_dma & 0xf;
+	src_len = vb2_get_plane_payload(&src_buf->vb2_buf, 0) - data_offset + start_byte;
+	src_buf_len = vb2_plane_size(&src_buf->vb2_buf, 0) - data_offset + start_byte;
+	src_dma -= start_byte;
 
 	/*
 	 * 调试用：确认送进硬件的确实是带 Annex-B 起始码的 slice NAL。
@@ -669,30 +607,25 @@ static void th1520_hevc_set_buffers(struct th1520_vdec_ctx *ctx)
 			dev_dbg(vpu->dev,
 				"stream len=%u buf=%u head=%*ph\n",
 				src_len, src_buf_len,
-				(int)min_t(u32, src_len, 16), p);
+				(int)min_t(u32, src_len - start_byte, 16), p + data_offset);
 	}
 
 	th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_STREAM, src_dma);
 	th1520_vdec_reg_write(vpu, &hevc_stream_len, src_len);
 	th1520_vdec_reg_write(vpu, &hevc_strm_buffer_len, src_buf_len);
 	th1520_vdec_reg_write(vpu, &hevc_strm_start_offset, 0);
-	th1520_vdec_reg_write(vpu, &hevc_strm_start_bit, 0);
+	th1520_vdec_reg_write(vpu, &hevc_strm_start_bit, start_byte * 8);
 	/*
-	 * START_CODE_E（产品表位置 swreg13[31]）= 1：V4L2 的 HEVC_SLICE 缓冲
-	 * 总是带 Annex-B 起始码，硬件自行搜索（golden 实测厂商栈对该码流
-	 * 也是置 1）。之前把这个位写到 G2 表位置 swreg10[31] 是解码失败的
-	 * 直接原因（真实 START_CODE_E=0，硬件把 00 00 01 当 NAL 解析）。
+	 * The negotiated HEVC input contains Annex-B start codes. Register 13
+	 * bit 31 enables hardware start-code parsing.
 	 */
 	th1520_vdec_reg_write(vpu, &hevc_start_code_e, 1);
 	/* 必须写 MV，否则后续帧无法做时域预测。 */
 	th1520_vdec_reg_write(vpu, &hevc_write_mvs_e, 1);
 
 	/*
-	 * LAST_BUFFER_E / BUFFER_EMPTY_INT_E（产品表位置 swreg3[0]/[2]）
-	 * 在 common config 里统一按 golden 值写：LAST_BUFFER_E=0（golden 实测，
-	 * 厂商以 STRM_BUFFER_LEN 环形缓冲模型工作）、BUFFER_EMPTY_INT_E=1
-	 * （万一硬件认为码流不足，会产生 DEC_BUFFER_INT 让驱动报错，
-	 * 而不是静默挂死）。
+	 * Common configuration enables the input-exhausted interrupt. Each
+	 * request supplies a complete frame and its available input-buffer size.
 	 */
 
 	th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_TILE_SIZES,
@@ -704,11 +637,13 @@ static void th1520_hevc_set_buffers(struct th1520_vdec_ctx *ctx)
 	th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_TILE_BSD,
 				    ctx->hevc.tile_bsd.dma);
 
-	/* swreg314 —— 输出 stride */
-	th1520_vdec_reg_write(vpu, &hevc_dec_out_y_stride,
-			      ctx->dst_fmt.plane_fmt[0].bytesperline);
-	th1520_vdec_reg_write(vpu, &hevc_dec_out_c_stride,
-			      ctx->dst_fmt.plane_fmt[0].bytesperline);
+	/*
+	 * Native tiled stride is the number of bytes in four luma or chroma rows.
+	 */
+	th1520_vdec_reg_write(vpu, &hevc_native_luma_stride,
+			      ALIGN(ctx->src_fmt.width * 4, 64));
+	th1520_vdec_reg_write(vpu, &hevc_native_chroma_stride,
+			      ALIGN(ctx->src_fmt.width * 4, 64));
 }
 
 /*
@@ -764,9 +699,82 @@ static void th1520_hevc_prepare_scaling_list(struct th1520_vdec_ctx *ctx)
 				    ctx->hevc.scaling_lists.dma);
 }
 
+static int th1520_hevc_validate_params(struct th1520_vdec_ctx *ctx)
+{
+	const struct v4l2_ctrl_hevc_sps *sps = ctx->hevc.ctrls.sps;
+	const struct v4l2_ctrl_hevc_pps *pps = ctx->hevc.ctrls.pps;
+	unsigned int min_cb_log2, max_ctb_log2, min_tb_log2, max_tb_log2;
+	unsigned int width_in_ctbs, height_in_ctbs, min_cb_size;
+	unsigned int cols = pps->num_tile_columns_minus1 + 1U;
+	unsigned int rows = pps->num_tile_rows_minus1 + 1U;
+	unsigned int sum, i;
+
+	if (!sps->pic_width_in_luma_samples || !sps->pic_height_in_luma_samples ||
+	    sps->chroma_format_idc != 1 || sps->bit_depth_luma_minus8 ||
+	    sps->bit_depth_chroma_minus8)
+		return -EINVAL;
+
+	/* Native surfaces and tile scratch buffers share the negotiated size. */
+	if (ALIGN(sps->pic_width_in_luma_samples, TH1520_MB_DIM) !=
+	    ctx->src_fmt.width ||
+	    ALIGN(sps->pic_height_in_luma_samples, TH1520_MB_DIM) !=
+	    ctx->src_fmt.height ||
+	    ctx->dst_fmt.width != ctx->src_fmt.width ||
+	    ctx->dst_fmt.height != ctx->src_fmt.height)
+		return -EINVAL;
+
+	/* Validate logarithms before using them in shifts or divisors. */
+	min_cb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3U;
+	max_ctb_log2 = min_cb_log2 + sps->log2_diff_max_min_luma_coding_block_size;
+	min_tb_log2 = sps->log2_min_luma_transform_block_size_minus2 + 2U;
+	max_tb_log2 = min_tb_log2 + sps->log2_diff_max_min_luma_transform_block_size;
+	if (min_cb_log2 > 6 || max_ctb_log2 < 4 || max_ctb_log2 > 6 ||
+	    min_tb_log2 > 5 || min_tb_log2 >= min_cb_log2 ||
+	    max_tb_log2 > 5 || max_tb_log2 > max_ctb_log2 ||
+	    sps->max_transform_hierarchy_depth_inter > max_ctb_log2 - min_tb_log2 ||
+	    sps->max_transform_hierarchy_depth_intra > max_ctb_log2 - min_tb_log2 ||
+	    sps->log2_max_pic_order_cnt_lsb_minus4 > 12)
+		return -EINVAL;
+
+	min_cb_size = 1U << min_cb_log2;
+	if (sps->pic_width_in_luma_samples % min_cb_size ||
+	    sps->pic_height_in_luma_samples % min_cb_size)
+		return -EINVAL;
+	width_in_ctbs = DIV_ROUND_UP(sps->pic_width_in_luma_samples,
+				     1U << max_ctb_log2);
+	height_in_ctbs = DIV_ROUND_UP(sps->pic_height_in_luma_samples,
+				      1U << max_ctb_log2);
+	if (cols > MAX_TILE_COLS || rows > MAX_TILE_ROWS ||
+	    cols > width_in_ctbs || rows > height_in_ctbs)
+		return -EINVAL;
+
+	if (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) {
+		if (!(pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING)) {
+			for (i = 0, sum = 0; i + 1 < cols; i++) {
+				sum += pps->column_width_minus1[i] + 1U;
+				if (sum >= width_in_ctbs)
+					return -EINVAL;
+			}
+			for (i = 0, sum = 0; i + 1 < rows; i++) {
+				sum += pps->row_height_minus1[i] + 1U;
+				if (sum >= height_in_ctbs)
+					return -EINVAL;
+			}
+		}
+	} else if (cols != 1 || rows != 1) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int th1520_hevc_prepare_run(struct th1520_vdec_ctx *ctx)
 {
 	struct th1520_vdec_hevc_ctrls *ctrls = &ctx->hevc.ctrls;
+	struct vb2_buffer *src = &th1520_vdec_get_src_buf(ctx)->vb2_buf;
+	const struct v4l2_ctrl_hevc_decode_params *dec;
+	unsigned int i;
+	int ret;
 
 	th1520_vdec_start_prepare_run(ctx);
 
@@ -781,13 +789,32 @@ static int th1520_hevc_prepare_run(struct th1520_vdec_ctx *ctx)
 	    !ctrls->pps)
 		return -EINVAL;
 
-	/*
-	 * CAPTURE 队列的分辨率是按 OUTPUT 格式配置好的，
-	 * 码流里的实际尺寸必须能装得下，否则硬件会写越界。
-	 */
-	if (ctrls->sps->pic_width_in_luma_samples > ctx->dst_fmt.width ||
-	    ctrls->sps->pic_height_in_luma_samples > ctx->dst_fmt.height)
+	ret = th1520_hevc_validate_params(ctx);
+	if (ret)
+		return ret;
+	if (src->planes[0].data_offset >= vb2_get_plane_payload(src, 0) ||
+	    vb2_get_plane_payload(src, 0) > vb2_plane_size(src, 0))
 		return -EINVAL;
+
+	dec = ctrls->decode_params;
+	/* One hardware reference slot holds the current picture. */
+	if (dec->num_active_dpb_entries >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX ||
+	    dec->num_poc_st_curr_before > dec->num_active_dpb_entries ||
+	    dec->num_poc_st_curr_after > dec->num_active_dpb_entries ||
+	    dec->num_poc_lt_curr > dec->num_active_dpb_entries)
+		return -EINVAL;
+	if ((unsigned int)dec->num_poc_st_curr_before + dec->num_poc_st_curr_after +
+	    dec->num_poc_lt_curr > dec->num_active_dpb_entries)
+		return -EINVAL;
+	for (i = 0; i < dec->num_poc_st_curr_before; i++)
+		if (dec->poc_st_curr_before[i] >= dec->num_active_dpb_entries)
+			return -EINVAL;
+	for (i = 0; i < dec->num_poc_st_curr_after; i++)
+		if (dec->poc_st_curr_after[i] >= dec->num_active_dpb_entries)
+			return -EINVAL;
+	for (i = 0; i < dec->num_poc_lt_curr; i++)
+		if (dec->poc_lt_curr[i] >= dec->num_active_dpb_entries)
+			return -EINVAL;
 
 	return th1520_hevc_tile_buffers_realloc(ctx);
 }
@@ -810,6 +837,8 @@ static int th1520_hevc_run(struct th1520_vdec_ctx *ctx)
 	th1520_hevc_set_buffers(ctx);
 	th1520_hevc_prepare_tile_info(ctx);
 	th1520_hevc_prepare_scaling_list(ctx);
+	th1520_vdec_set_postproc(ctx, ctx->hevc.ctrls.sps->pic_width_in_luma_samples,
+				ctx->hevc.ctrls.sps->pic_height_in_luma_samples);
 
 	th1520_vdec_end_prepare_run(ctx);
 	th1520_vdec_start(ctx->dev);
@@ -864,8 +893,6 @@ static int th1520_hevc_init(struct th1520_vdec_ctx *ctx)
 		return -ENOMEM;
 	}
 	hevc->scaling_lists.size = SCALING_LIST_SIZE;
-
-	th1520_hevc_ref_init(ctx);
 
 	return 0;
 }

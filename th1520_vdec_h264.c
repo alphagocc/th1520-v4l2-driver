@@ -1,41 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * TH1520 VC8000D — H.264 (G1 legacy, DEC_MODE = 0) stateless 后端。
+ * TH1520 VC8000D H.264 stateless decoding, hardware modes 0 and 15.
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 控件到寄存器的映射来自 VC8000D 产品表（product id 0x8001，
- * 表 @0x4CBB80；位域图 analysis/vc8000d-register-config/swreg-map-vc8000d.md，
- * 分析与 golden 对照见 analysis/vc8000d-product-table.md）。
- * G1 表（@0x4D40A0）的字段位置对 TH1520 无效——产品表把 H.264 的
- * 地址寄存器统一到了 HEVC 风格位置（STREAM@168/169、OUT@64/65、
- * REF@66+2i/67+2i、DIRMV@132/133、QTABLE@174/175），START_CODE_E/INIT_QP
- * 统一在 swreg13[31]/[30:24]，STREAM_LEN 为 32 bit。
+ * DPB management and auxiliary-table handling adapted from Linux
+ * hantro_h264.c and hantro_g1_h264_dec.c:
+ * Copyright (c) 2014 Rockchip Electronics Co., Ltd.
+ *     Hertz Wong <hertz.wong@rock-chips.com>
+ *     Herman Chen <herman.chen@rock-chips.com>
+ * Copyright (C) 2014 Google, Inc.
+ *     Tomasz Figa <tfiga@chromium.org>
  *
- * DPB 匹配、参考列表构建与 CABAC/POC/缩放矩阵表的布局，参考上游
- * drivers/media/platform/verisilicon/{hantro_h264.c,hantro_g1_h264_dec.c}
- * （GPL-2.0，Copyright (c) 2014 Rockchip Electronics / Google Inc.，
- *  Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4）。
- *
- * 产品表与上游 G1 布局同位置的寄存器（已逐 id 核对，见
- * analysis/vc8000d-product-table.md §5.4）：
- *   REFERn_NBR         swreg30+i（每个寄存器两个 16 bit frame_num）
- *   REFER_LTERM_E      swreg38
- *   REFER_VALID_E      swreg39
- *   BINIT_RLIST_*      swreg42+i（B 帧 L0/L1 初始列表）
- *   B_REF_PIC 第15项+P前4项 swreg47
- *   PINIT_RLIST_F4..15 swreg10/11（P 帧 L0 初始列表）
- *   PRED_BC_TAP_0_x    swreg49
- * 与上游 G1 布局不同、已按产品表改写的：全部地址寄存器、
- * START_CODE_E/INIT_QP、STRM_START_BIT（7 bit）、STREAM_LEN（32 bit）、
- * APF_THRESHOLD（16 bit）、swreg2（只有 swap 域+CLK_GATE_E）、
- * MAX_BURST/BUSWIDTH/AXI_RD_ID_E（swreg58）、超时（swreg318/319）。
+ * Linux commit 8ba098e6b6ff0db8edf28528d1552be261af30d4.
+ * Public source links are in docs/sources.md. TH1520 register placement,
+ * mode selection and native-buffer layouts are described in docs/hardware.md.
  */
 
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
+#include <linux/overflow.h>
 #include <linux/swab.h>
 
 #include <media/v4l2-h264.h>
@@ -49,14 +35,26 @@
 /* 缩放矩阵：6 个 4x4 表 + 2 个 8x8 表（只有 Intra/Inter Y） */
 #define SCALING_LIST_LEN		(6 * 16 + 2 * 64)
 
+/* Product-table dimensions selected by build 0x1f88 in both H.264 engines. */
+#define h264_pic_width_in_cbs		TH1520_REG(4, 19, 0x1fff)
+#define h264_pic_height_in_cbs		TH1520_REG(4, 6, 0x1fff)
+#define h264_min_cb_size			TH1520_REG(12, 13, 0x7)
+#define h264_max_cb_size			TH1520_REG(12, 10, 0x7)
+#define h264_pic_width_4x4		TH1520_REG(20, 16, 0xfff)
+#define h264_pic_height_4x4		TH1520_REG(20, 0, 0xfff)
+#define h264_h10_bit_depth_y_minus8	TH1520_REG(8, 6, 0x3)
+#define h264_h10_bit_depth_c_minus8	TH1520_REG(8, 4, 0x3)
+#define h264_h10_idr_pic_id		TH1520_REG(12, 16, 0xffff)
+
 /*
- * 硬件读取的私有表布局。QTABLE_BASE（swreg40/140）指向本结构开头。
- * 三段的顺序与上游 struct hantro_h264_dec_priv_tbl 一致。
+ * Auxiliary table: 3680 CABAC bytes, 136 POC bytes, then scaling lists.
+ * Mode 0 places scaling data at byte 3816; mode 15 adds eight padding
+ * bytes and places it at byte 3824. Reserve capacity for the larger form.
  */
 struct th1520_vdec_h264_priv_tbl {
 	u32 cabac_table[TH1520_H264_CABAC_TABLE_LEN];
 	u32 poc[POC_BUFFER_LEN];
-	u8 scaling_list[SCALING_LIST_LEN];
+	u8 scaling_list[SCALING_LIST_LEN + 8];
 };
 
 /*
@@ -76,7 +74,8 @@ static void th1520_h264_assemble_scaling_list(struct th1520_vdec_ctx *ctx)
 	struct th1520_vdec_h264_priv_tbl *tbl = ctx->h264.priv.cpu;
 	const size_t list_len_4x4 = ARRAY_SIZE(scaling->scaling_list_4x4[0]);
 	const size_t list_len_8x8 = ARRAY_SIZE(scaling->scaling_list_8x8[0]);
-	u32 *dst = (u32 *)tbl->scaling_list;
+	u32 *dst = (u32 *)(tbl->scaling_list +
+			  (ctx->h264.high10p_mode ? 8 : 0));
 	const u32 *src;
 	unsigned int i, j;
 
@@ -202,7 +201,7 @@ static void th1520_h264_update_dpb(struct th1520_vdec_ctx *ctx)
 }
 
 /*
- * 参考帧地址寄存器（swreg14..29）的低 2 bit 被复用为标志位：
+ * 参考帧地址寄存器（swreg67+2i）的低 2 bit 被复用为标志位：
  *   bit1 = REFERn_FIELD_E（该参考项是场）
  *   bit0 = REFERn_TOPC_E （使用顶场）
  * 解码缓冲至少 16 字节对齐，所以低 2 bit 一定为 0，可以安全复用。
@@ -224,7 +223,7 @@ static dma_addr_t th1520_h264_get_ref_buf(struct th1520_vdec_ctx *ctx,
 		 */
 		struct vb2_v4l2_buffer *dst_buf = th1520_vdec_get_dst_buf(ctx);
 
-		dma_addr = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
+		dma_addr = th1520_vdec_vbuf_to_buffer(dst_buf)->native.dma;
 	}
 
 	flags = (dpb[dpb_idx].flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD) ? 0x2 : 0;
@@ -283,9 +282,8 @@ static void th1520_h264_set_params(struct th1520_vdec_ctx *ctx)
 	const struct v4l2_ctrl_h264_sps *sps = ctrls->sps;
 	const struct v4l2_ctrl_h264_pps *pps = ctrls->pps;
 	struct th1520_vdec_dev *vpu = ctx->dev;
-	struct vb2_v4l2_buffer *src_buf = th1520_vdec_get_src_buf(ctx);
-	unsigned int mb_height;
-	u32 stream_len;
+	unsigned int mb_width = TH1520_MB_WIDTH(ctx->src_fmt.width);
+	unsigned int mb_height = TH1520_MB_HEIGHT(ctx->src_fmt.height);
 
 	/* swreg3 —— 图像结构 */
 	th1520_vdec_reg_write(vpu, &h264_seq_mbaff_e,
@@ -307,14 +305,18 @@ static void th1520_h264_set_params(struct th1520_vdec_ctx *ctx)
 	if (!(dec->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD))
 		th1520_vdec_reg_write(vpu, &h264_pic_topfield_e, 1);
 
-	/* swreg4 —— 图像尺寸（单位：宏块）与参考帧数 */
-	mb_height = TH1520_MB_HEIGHT(ctx->src_fmt.height);
-	th1520_vdec_reg_write(vpu, &h264_pic_mb_width,
-			      TH1520_MB_WIDTH(ctx->src_fmt.width));
-	th1520_vdec_reg_write(vpu, &h264_pic_mb_height_p, mb_height);
-	/* PIC_MB_HEIGHT_P 只有 8 bit，>255 时高位放在 swreg7[25]。 */
-	th1520_vdec_reg_write(vpu, &h264_pic_mb_h_ext, mb_height >> 8);
+	/*
+	 * Build 0x1f88 uses 8x8 coding-block dimensions within 16x16 macroblocks.
+	 * The 4x4 dimensions describe the same image; partial-CTB flags remain
+	 * clear because H.264 coded dimensions contain complete macroblocks.
+	 */
+	th1520_vdec_reg_write(vpu, &h264_pic_width_in_cbs, mb_width * 2);
+	th1520_vdec_reg_write(vpu, &h264_pic_height_in_cbs, mb_height * 2);
 	th1520_vdec_reg_write(vpu, &h264_ref_frames, sps->max_num_ref_frames);
+	th1520_vdec_reg_write(vpu, &h264_min_cb_size, 3);
+	th1520_vdec_reg_write(vpu, &h264_max_cb_size, 4);
+	th1520_vdec_reg_write(vpu, &h264_pic_width_4x4, mb_width * 4);
+	th1520_vdec_reg_write(vpu, &h264_pic_height_4x4, mb_height * 4);
 
 	/* swreg5 —— 色度 QP 偏移与场图像标志 */
 	th1520_vdec_reg_write(vpu, &h264_ch_qp_offset,
@@ -325,15 +327,9 @@ static void th1520_h264_set_params(struct th1520_vdec_ctx *ctx)
 			      !!(pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT));
 	th1520_vdec_reg_write(vpu, &h264_fieldpic_flag_e,
 			      !(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY));
-	/* 每个 OUTPUT buffer 从字节边界开始，起始位偏移恒为 0。 */
-	th1520_vdec_reg_write(vpu, &h264_strm_start_bit, 0);
-
-	/* swreg6 —— 起始码搜索、初始 QP 与码流长度 */
-	th1520_vdec_reg_write(vpu, &h264_start_code_e, 1);
+	/* swreg13[30:24] —— 初始 QP */
 	th1520_vdec_reg_write(vpu, &h264_init_qp,
 			      pps->pic_init_qp_minus26 + 26);
-	stream_len = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
-	th1520_vdec_reg_write(vpu, &h264_stream_len, stream_len);
 
 	/* swreg7 —— 熵编码与 frame_num */
 	th1520_vdec_reg_write(vpu, &h264_framenum_len,
@@ -354,7 +350,14 @@ static void th1520_h264_set_params(struct th1520_vdec_ctx *ctx)
 	/* swreg8 —— PPS 标志、dec_ref_pic_marking 长度与 IDR */
 	th1520_vdec_reg_write(vpu, &h264_refpic_mk_len,
 			      dec->dec_ref_pic_marking_bit_size);
-	th1520_vdec_reg_write(vpu, &h264_idr_pic_id, dec->idr_pic_id);
+	if (ctx->h264.high10p_mode) {
+		/* H264SetupVlcRegs @0x7b1ce selects id339 in mode 15. */
+		th1520_vdec_reg_write(vpu, &h264_h10_idr_pic_id, dec->idr_pic_id);
+		th1520_vdec_reg_write(vpu, &h264_h10_bit_depth_y_minus8, 0);
+		th1520_vdec_reg_write(vpu, &h264_h10_bit_depth_c_minus8, 0);
+	} else {
+		th1520_vdec_reg_write(vpu, &h264_idr_pic_id, dec->idr_pic_id);
+	}
 	th1520_vdec_reg_write(vpu, &h264_const_intra_e,
 			      !!(pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED));
 	th1520_vdec_reg_write(vpu, &h264_filt_ctrl_pres,
@@ -376,9 +379,9 @@ static void th1520_h264_set_params(struct th1520_vdec_ctx *ctx)
 			      dec->pic_order_cnt_bit_size);
 
 	/* swreg314 —— 输出 stride */
-	th1520_vdec_reg_write(vpu, &h264_dec_out_y_stride,
+	th1520_vdec_reg_write(vpu, &h264_native_luma_stride,
 			      ctx->dst_fmt.plane_fmt[0].bytesperline);
-	th1520_vdec_reg_write(vpu, &h264_dec_out_c_stride,
+	th1520_vdec_reg_write(vpu, &h264_native_chroma_stride,
 			      ctx->dst_fmt.plane_fmt[0].bytesperline);
 }
 
@@ -406,8 +409,8 @@ static void th1520_h264_set_ref(struct th1520_vdec_ctx *ctx)
 	b1 = ctx->h264.reflists.b1;
 	p = ctx->h264.reflists.p;
 
-	/* swreg42..46：B 帧 L0/L1 的第 0..14 项，每个寄存器三组 */
-	reg_num = 0;
+	/* H264InitRefPicList @0x7c432: select INIT_RLIST or BINIT_RLIST. */
+	reg_num = ctx->h264.high10p_mode ? 14 : 42;
 	for (i = 0; i < 15; i += 3) {
 		reg = ((b0[i].index     & 0x1f) << 0) |
 		      ((b1[i].index     & 0x1f) << 5) |
@@ -415,15 +418,18 @@ static void th1520_h264_set_ref(struct th1520_vdec_ctx *ctx)
 		      ((b1[i + 1].index & 0x1f) << 15) |
 		      ((b0[i + 2].index & 0x1f) << 20) |
 		      ((b1[i + 2].index & 0x1f) << 25);
-		th1520_vdec_reg_write_raw(vpu,
-					  TH1520_H264_SWREG_BD_REF_PIC(reg_num++),
-					  reg);
+		th1520_vdec_reg_write_raw(vpu, reg_num++, reg);
 	}
 
-	/* swreg47：B 列表第 15 项 + P 列表第 0..3 项 */
+	/* The final B-list pair is in swreg19 for mode 15, or swreg47 otherwise. */
 	reg = ((b0[15].index & 0x1f) << 0) |
-	      ((b1[15].index & 0x1f) << 5) |
-	      ((p[0].index   & 0x1f) << 10) |
+	      ((b1[15].index & 0x1f) << 5);
+	if (ctx->h264.high10p_mode) {
+		th1520_vdec_reg_write_raw(vpu, 19, reg);
+		reg = 0;
+	}
+	/* P-list entries keep their positions in both modes. */
+	reg |= ((p[0].index  & 0x1f) << 10) |
 	      ((p[1].index   & 0x1f) << 15) |
 	      ((p[2].index   & 0x1f) << 20) |
 	      ((p[3].index   & 0x1f) << 25);
@@ -443,57 +449,96 @@ static void th1520_h264_set_ref(struct th1520_vdec_ctx *ctx)
 					  reg);
 	}
 
-	/* swreg14..29 / swreg124..139：16 路参考帧基址（低 2 bit 为标志位） */
+	/* swreg66+2i/67+2i：16 路参考帧基址（低 2 bit 为标志位） */
 	for (i = 0; i < TH1520_DPB_SIZE; i++)
 		th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_REF_LSB(i),
 				       TH1520_H264_ADDR_REF_MSB(i),
 				       th1520_h264_get_ref_buf(ctx, i));
 }
 
+static int th1520_h264_set_stream(struct th1520_vdec_ctx *ctx)
+{
+	struct th1520_vdec_dev *vpu = ctx->dev;
+	struct vb2_v4l2_buffer *src_buf = th1520_vdec_get_src_buf(ctx);
+	struct vb2_buffer *src = &src_buf->vb2_buf;
+	u32 data_offset = src->planes[0].data_offset;
+	u32 bytesused = vb2_get_plane_payload(src, 0);
+	dma_addr_t stream_dma;
+	u32 prefix, stream_len;
+
+	if (data_offset >= bytesused || bytesused > vb2_plane_size(src, 0))
+		return -EINVAL;
+
+	stream_dma = vb2_dma_contig_plane_dma_addr(src, 0) + data_offset;
+	prefix = stream_dma & 15;
+	if (check_add_overflow(bytesused - data_offset, prefix, &stream_len))
+		return -EINVAL;
+
+	/*
+	 * VC8000D h264StreamPosUpdate() @ 0x7c838: the 128-bit bus
+	 * uses a 16-byte base and a bit offset within the first bus word.
+	 * The normal H.264 branch writes the same length to ids 161 and
+	 * 1360 and clears id 1361.  The product table maps the
+	 * latter two ids to swreg258/259 (0x7cc5a, 0x7cc6e, 0x7cc88).
+	 * V4L2 bytesused includes data_offset; only the payload is decoded.
+	 */
+	th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_STREAM_LSB,
+			       TH1520_H264_ADDR_STREAM_MSB, stream_dma - prefix);
+	th1520_vdec_reg_write(vpu, &h264_strm_start_bit, prefix * 8);
+	th1520_vdec_reg_write(vpu, &h264_start_code_e, 1);
+	th1520_vdec_reg_write(vpu, &h264_stream_len, stream_len);
+	th1520_vdec_reg_write_raw(vpu, 258, stream_len);
+	th1520_vdec_reg_write_raw(vpu, 259, 0);
+
+	return 0;
+}
+
 static void th1520_h264_set_buffers(struct th1520_vdec_ctx *ctx)
 {
 	const struct th1520_vdec_h264_ctrls *ctrls = &ctx->h264.ctrls;
 	struct th1520_vdec_dev *vpu = ctx->dev;
-	struct vb2_v4l2_buffer *src_buf = th1520_vdec_get_src_buf(ctx);
 	struct vb2_v4l2_buffer *dst_buf = th1520_vdec_get_dst_buf(ctx);
-	dma_addr_t src_dma, dst_dma;
-	size_t offset = 0;
+	struct th1520_vdec_buffer *dst = th1520_vdec_vbuf_to_buffer(dst_buf);
+	dma_addr_t dst_dma;
+	size_t mv_offset = th1520_vdec_h264_native_mv_offset(ctx);
+	size_t chroma_offset = th1520_vdec_h264_native_chroma_offset(ctx);
+	size_t sync_offset;
+	unsigned int i;
 
-	src_dma = vb2_dma_contig_plane_dma_addr(&src_buf->vb2_buf, 0);
-	th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_STREAM_LSB,
-			       TH1520_H264_ADDR_STREAM_MSB, src_dma);
-
-	dst_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
-	/* 底场从第二行开始写。 */
-	if (ctrls->decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)
-		offset = ctx->dst_fmt.plane_fmt[0].bytesperline;
+	dst_dma = dst->native.dma;
 	th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_DST_LSB,
-			       TH1520_H264_ADDR_DST_MSB, dst_dma + offset);
+			       TH1520_H264_ADDR_DST_MSB, dst_dma);
 
-	/*
-	 * direct-MV 缓冲紧跟在 NV12 帧之后。
-	 * 帧大小 = bytesperline * ALIGN(height,16) * 3/2 = 384 * MB_W * MB_H，
-	 * 与 th1520_vdec_fill_pixfmt_cap() 的布局一致。
-	 *
-	 * 与上游的差异：上游对单色码流用 256 字节/MB 计算偏移，因为它不为
-	 * 单色分配色度平面；本驱动的 CAPTURE 始终是完整 NV12，
-	 * 因此偏移统一按 384 字节/MB 计算，与自身的缓冲布局自洽。
-	 */
 	if (ctrls->sps->profile_idc > 66 && ctrls->decode->nal_ref_idc) {
-		unsigned int mb_w = TH1520_MB_WIDTH(ctx->src_fmt.width);
-		unsigned int mb_h = TH1520_MB_HEIGHT(ctx->src_fmt.height);
-
-		offset = 384 * mb_w * mb_h;
-
-		/* 场编码时 DMV 缓冲一分为二，底场用后半段。 */
-		if (ctrls->decode->flags &
-		    V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)
-			offset += 32 * mb_w * mb_h;
-
 		th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_DIR_MV_LSB,
 				       TH1520_H264_ADDR_DIR_MV_MSB,
-				       dst_dma + offset);
+				       dst_dma + mv_offset);
 	}
+
+	if (ctx->h264.high10p_mode) {
+		th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_OUT_CHROMA,
+					    dst_dma + chroma_offset);
+		for (i = 0; i < TH1520_DPB_SIZE; i++) {
+			dma_addr_t ref = th1520_h264_get_ref_buf(ctx, i);
+
+			th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_REF_CHROMA(i),
+						    ref + chroma_offset);
+			th1520_vdec_write_addr_pair(vpu, TH1520_HEVC_ADDR_REF_MV(i),
+						    (ref & ~(dma_addr_t)3) + mv_offset);
+		}
+		sync_offset = mv_offset - 32;
+	} else {
+		sync_offset = mv_offset + 64 * TH1520_MB_WIDTH(ctx->src_fmt.width) *
+			      TH1520_MB_HEIGHT(ctx->src_fmt.height);
+	}
+	/* h264bsdInitDpb initializes the 32-byte picture synchronization area. */
+	memset((u8 *)dst->native.cpu + sync_offset, 0xff, 32);
+
+	th1520_vdec_reg_write(vpu, &h264_native_luma_stride,
+			      ALIGN(ctx->src_fmt.width * 4, 64));
+	th1520_vdec_reg_write(vpu, &h264_native_chroma_stride,
+			      ALIGN(ctx->src_fmt.width * 4, 64));
+	th1520_vdec_set_postproc(ctx, ctx->src_fmt.width, ctx->src_fmt.height);
 
 	/* CABAC 表 / POC 表 / 缩放矩阵所在的私有 DMA 缓冲 */
 	th1520_vdec_write_addr(vpu, TH1520_H264_ADDR_QTABLE_LSB,
@@ -505,6 +550,12 @@ static int th1520_h264_prepare_run(struct th1520_vdec_ctx *ctx)
 {
 	struct th1520_vdec_h264_ctrls *ctrls = &ctx->h264.ctrls;
 	struct v4l2_h264_reflist_builder reflist_builder;
+	struct vb2_v4l2_buffer *dst_buf = th1520_vdec_get_dst_buf(ctx);
+	struct th1520_vdec_buffer *dst = th1520_vdec_vbuf_to_buffer(dst_buf);
+	const struct v4l2_ctrl_h264_sps *sps;
+	u32 width, height;
+	size_t required_size;
+	unsigned int i;
 
 	th1520_vdec_start_prepare_run(ctx);
 
@@ -518,7 +569,41 @@ static int th1520_h264_prepare_run(struct th1520_vdec_ctx *ctx)
 	if (!ctrls->scaling || !ctrls->decode || !ctrls->sps || !ctrls->pps)
 		return -EINVAL;
 
+	sps = ctrls->sps;
+	/* This implementation supports progressive 8-bit 4:2:0 pictures. */
+	if (sps->chroma_format_idc != 1 || sps->bit_depth_luma_minus8 ||
+	    sps->bit_depth_chroma_minus8 ||
+	    !(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY) ||
+	    (sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) ||
+	    (ctrls->decode->flags & (V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC |
+				     V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)))
+		return -EINVAL;
+
+	/*
+	 * Baseline profile 66 uses mode 0. The supported Main and High profiles
+	 * use mode 15. This engine selection is validated for 8-bit input and
+	 * does not advertise High 10 profile support.
+	 */
+	ctx->h264.high10p_mode = sps->profile_idc != 66;
+
+	width = (sps->pic_width_in_mbs_minus1 + 1U) * TH1520_MB_DIM;
+	height = (sps->pic_height_in_map_units_minus1 + 1U) * TH1520_MB_DIM;
+	if (width != ALIGN(ctx->src_fmt.width, TH1520_MB_DIM) ||
+	    height != ALIGN(ctx->src_fmt.height, TH1520_MB_DIM) ||
+	    width != ALIGN(ctx->dst_fmt.width, TH1520_MB_DIM) ||
+	    height != ALIGN(ctx->dst_fmt.height, TH1520_MB_DIM) ||
+	    width != ctx->dst_fmt.plane_fmt[0].bytesperline)
+		return -EINVAL;
+
+	required_size = th1520_vdec_h264_native_size(ctx);
+	if (!dst->native.cpu || dst->native.size < required_size)
+		return -EINVAL;
+
 	th1520_h264_update_dpb(ctx);
+	for (i = 0; i < TH1520_DPB_SIZE; i++)
+		if ((ctx->h264.dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) &&
+		    !th1520_vdec_get_ref(ctx, ctx->h264.dpb[i].reference_ts))
+			return -ENOENT;
 
 	v4l2_h264_init_reflist_builder(&reflist_builder, ctrls->decode,
 				       ctrls->sps, ctx->h264.dpb);
@@ -554,11 +639,10 @@ static int th1520_h264_run(struct th1520_vdec_ctx *ctx)
 	if (ret)
 		goto err_complete_request;
 
-	/*
-	 * STREAM_LEN 在产品表中是完整 32 bit（与 HEVC 相同），
-	 * G1 表的 24 bit 截断在 VC8000D 上不适用，无需再做长度检查。
-	 */
 	th1520_vdec_set_common_config(ctx);
+	ret = th1520_h264_set_stream(ctx);
+	if (ret)
+		goto err_complete_request;
 	th1520_h264_set_params(ctx);
 	th1520_h264_set_ref(ctx);
 	th1520_h264_set_buffers(ctx);

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-2.0-only
 #
 # Out-of-tree build for the TH1520 VC8000D V4L2 decoder driver.
 #

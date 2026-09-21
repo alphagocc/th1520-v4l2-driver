@@ -1,12 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * TH1520 VC8000D V4L2 stateless decoder driver.
  *
  * Copyright (C) 2026 th1520-v4l2 contributors
  *
- * 结构参考上游 drivers/media/platform/verisilicon/（Linux commit
- * 8ba098e6b6ff0db8edf28528d1552be261af30d4）与 drivers/media/test-drivers/vicodec/。
- * 寄存器语义来自 analysis/vc8000d-register-config/，见 th1520_vdec_regs.h。
+ * V4L2 framework references and licensing are listed in docs/sources.md.
+ * The supported hardware interface is documented in docs/hardware.md.
  */
 
 #ifndef TH1520_VDEC_H_
@@ -38,16 +37,14 @@
 #define TH1520_VDEC_NUM_CLOCKS		3
 
 /*
- * DT 的 reg 指向 VPU 子系统基址；VC8000D 解码核在其 +0x1000 处，
- * 寄存器窗口 1023 个 u32。
- * 出处：reference/vpu-vc8000d-kernel/linux/subsys_driver/subsys.c
- *   {0, 0, HW_VC8000D, 0x1000, 1023*4, -1, 0}
- * 已在 RevyOS 6.6.119-th1520 的实际设备树上确认子系统基址为 0xffecc00000。
+ * The device-tree resource starts at the VPU subsystem base.
+ * The decoder occupies 1023 32-bit registers at offset 0x1000.
+ * See docs/hardware.md for the supported device-tree contract.
  */
 #define TH1520_VDEC_CORE_OFFSET		0x1000
 #define TH1520_VDEC_CORE_IOSIZE		(1023 * 4)
 
-/* 宏块 / CTB 几何 */
+/* H.264 macroblock edge length, columns, and rows */
 #define TH1520_MB_DIM			16
 #define TH1520_MB_WIDTH(w)		DIV_ROUND_UP(w, TH1520_MB_DIM)
 #define TH1520_MB_HEIGHT(h)		DIV_ROUND_UP(h, TH1520_MB_DIM)
@@ -77,6 +74,16 @@ struct th1520_vdec_aux_buf {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+};
+
+/**
+ * struct th1520_vdec_buffer - 队列缓冲及其私有原生参考帧
+ * @m2m:      V4L2 M2M 队列缓冲
+ * @native:   HEVC 原生帧及 direct-MV，随 CAPTURE 缓冲分配和释放
+ */
+struct th1520_vdec_buffer {
+	struct v4l2_m2m_buffer m2m;
+	struct th1520_vdec_aux_buf native;
 };
 
 enum th1520_vdec_codec_mode {
@@ -125,14 +132,14 @@ struct th1520_vdec_codec_ops {
  * @reg_base:	 VC8000D 寄存器块的 ioremap 结果
  * @irq:	 解码中断
  * @vpu_mutex:	 保护 V4L2 设备级操作
- * @irqlock:	 保护 @regs 与中断状态
+ * @irqlock:	 保护活动作业、超时时间与中断状态
  * @watchdog_work: 软件超时处理
+ * @active_ctx:   当前硬件作业；完成处理取得该指针后清零
+ * @watchdog_deadline: 当前作业的 jiffies 截止时间，由 irqlock 保护
  * @regs:	 影子寄存器数组
  *
- * @regs 的模型来自真实交付栈：用户态 DWL 维护一整片影子寄存器，
- * 配置完成后一次性推给硬件（HANTRODEC_IOCS_DEC_PUSH_REG）。
- * 本驱动沿用同一模型，好处是每个被写入的寄存器的每一位都由驱动完全决定，
- * 不依赖未经验证的硬件复位值，也不依赖上一帧的残留。
+ * The shadow block is rebuilt for every job so register values do not
+ * depend on the previous context or hardware reset defaults.
  *
  * 由于 v4l2-m2m 保证同一时刻只有一个 job 在跑，@regs 放在 dev 上即可。
  */
@@ -149,22 +156,17 @@ struct th1520_vdec_dev {
 	int irq;
 
 	struct mutex vpu_mutex;	/* 串行化 V4L2 设备级操作 */
-	spinlock_t irqlock;	/* 保护 regs[] 与中断路径 */
+	spinlock_t irqlock;	/* Active job, deadline and IRQ status. */
 
 	struct delayed_work watchdog_work;
+	struct th1520_vdec_ctx *active_ctx;
+	unsigned long watchdog_deadline;
 
 	u32 regs[TH1520_VDEC_REG_COUNT];
 	/*
-	 * 本帧真正被写过的寄存器。
-	 *
-	 * 两种 flush 策略：
-	 *  - 全量（flush_all=1）：写 swreg3..N 全部，与真实交付栈的
-	 *    "推送整片影子寄存器" 一致，但会把驱动没设置的寄存器强制清 0。
-	 *  - 稀疏（flush_all=0，默认）：只写本帧标记为 dirty 的寄存器，
-	 *    其余保持硬件当前值，与上游 mainline hantro 的行为一致。
-	 *
-	 * 需要稀疏模式的原因：某些位的正确值来自硬件复位值，
-	 * 驱动并不知道该写什么；全量清零会把它们破坏掉。
+	 * Dirty-register bitmap for optional diagnostic sparse submissions.
+	 * The default flush_all=1 writes all configuration registers to prevent
+	 * state from leaking between codecs or contexts.
 	 */
 	DECLARE_BITMAP(reg_dirty, TH1520_VDEC_REG_COUNT);
 };
@@ -185,6 +187,7 @@ struct th1520_vdec_h264_reflists {
 };
 
 struct th1520_vdec_h264_ctx {
+	bool high10p_mode;
 	struct th1520_vdec_aux_buf priv;
 	struct v4l2_h264_dpb_entry dpb[TH1520_DPB_SIZE];
 	struct th1520_vdec_h264_reflists reflists;
@@ -260,6 +263,7 @@ void th1520_vdec_write_addr(struct th1520_vdec_dev *vpu, u16 lsb_swreg,
 void th1520_vdec_write_addr_pair(struct th1520_vdec_dev *vpu, u16 msb_swreg,
 				 dma_addr_t addr);
 void th1520_vdec_set_common_config(struct th1520_vdec_ctx *ctx);
+void th1520_vdec_set_postproc(struct th1520_vdec_ctx *ctx, u32 width, u32 height);
 void th1520_vdec_start(struct th1520_vdec_dev *vpu);
 void th1520_vdec_dump_regs(struct th1520_vdec_dev *vpu, const char *why);
 void th1520_vdec_hw_reset(struct th1520_vdec_ctx *ctx);
@@ -273,6 +277,7 @@ void vdpu_write(struct th1520_vdec_dev *vpu, u32 val, u32 offset);
 extern const struct v4l2_event th1520_vdec_eos_event;
 
 void th1520_vdec_irq_done(struct th1520_vdec_dev *vpu,
+			  struct th1520_vdec_ctx *ctx,
 			  enum vb2_buffer_state result);
 void th1520_vdec_watchdog(struct work_struct *work);
 void th1520_vdec_start_prepare_run(struct th1520_vdec_ctx *ctx);
@@ -299,7 +304,13 @@ extern const struct th1520_vdec_codec_ops th1520_vdec_hevc_ops;
 #define TH1520_H264_CABAC_TABLE_LEN	(460 * 2)
 extern const u32 th1520_vdec_h264_cabac_table[TH1520_H264_CABAC_TABLE_LEN];
 
-/* --- 缓冲区几何 -------------------------------------------------------- */
+/* --- 缓冲区尺寸与布局 -------------------------------------------------- */
+
+static inline struct th1520_vdec_buffer *
+th1520_vdec_vbuf_to_buffer(struct vb2_v4l2_buffer *vbuf)
+{
+	return container_of(vbuf, struct th1520_vdec_buffer, m2m.vb);
+}
 
 static inline struct vb2_v4l2_buffer *
 th1520_vdec_get_src_buf(struct th1520_vdec_ctx *ctx)
@@ -325,13 +336,62 @@ static inline size_t th1520_vdec_h264_mv_size(unsigned int width,
 }
 
 /*
- * HEVC 的 direct-MV 缓冲：按最小 CTB（16x16）的最坏情况分配。
- * 与上游 hantro_hevc_mv_size() 一致。
+ * HEVC 原生参考帧采用 4x4 tile，后处理器向 CAPTURE 输出线性 NV12。
+ * 原生 Y stride = ALIGN(coded_width * 4, 64)，Y 区域每四行占一条 tile 行。
+ * 色度区域按 64 字节补齐，随后预留 64 字节，再保存每个 64x64 CTB
+ * 对应的 256 字节 direct-MV 数据。尺寸取格式协商确定的 coded size，
+ * CAPTURE 缓冲存在期间该尺寸保持固定。
  */
-static inline size_t th1520_vdec_hevc_mv_size(unsigned int width,
-					      unsigned int height)
+static inline size_t
+th1520_vdec_hevc_native_chroma_offset(const struct th1520_vdec_ctx *ctx)
 {
-	return width * height / 16;
+	size_t stride = ALIGN(ctx->src_fmt.width * 4, 64);
+
+	return stride * ALIGN(ctx->src_fmt.height, TH1520_MB_DIM) / 4;
+}
+
+static inline size_t
+th1520_vdec_hevc_native_mv_offset(const struct th1520_vdec_ctx *ctx)
+{
+	size_t luma_size = th1520_vdec_hevc_native_chroma_offset(ctx);
+
+	return luma_size + ALIGN(luma_size / 2, 64) + 64;
+}
+
+static inline size_t
+th1520_vdec_hevc_native_size(const struct th1520_vdec_ctx *ctx)
+{
+	size_t mv_size = DIV_ROUND_UP(ctx->src_fmt.width, 64) *
+			 DIV_ROUND_UP(ctx->src_fmt.height, 64) * 256;
+
+	return th1520_vdec_hevc_native_mv_offset(ctx) + mv_size;
+}
+
+/* H264 mode15 uses the same Y/C/sync layout, with 80 bytes per MB for MV.
+ * h264bsdInitDpb @0x8595a..0x85a4e, uncompressed 8-bit tiled output.
+ */
+static inline size_t
+th1520_vdec_h264_native_chroma_offset(const struct th1520_vdec_ctx *ctx)
+{
+	return th1520_vdec_hevc_native_chroma_offset(ctx);
+}
+
+static inline size_t
+th1520_vdec_h264_native_mv_offset(const struct th1520_vdec_ctx *ctx)
+{
+	if (ctx->h264.high10p_mode)
+		return th1520_vdec_hevc_native_mv_offset(ctx);
+	return th1520_vdec_h264_native_chroma_offset(ctx) * 3 / 2;
+}
+
+static inline size_t
+th1520_vdec_h264_native_size(const struct th1520_vdec_ctx *ctx)
+{
+	size_t mbs = TH1520_MB_WIDTH(ctx->src_fmt.width) *
+		     TH1520_MB_HEIGHT(ctx->src_fmt.height);
+
+	/* Allocate before per-request SPS determines mode0/mode15. */
+	return th1520_vdec_hevc_native_mv_offset(ctx) + ALIGN(80 * ALIGN(mbs, 4), 64);
 }
 
 #endif /* TH1520_VDEC_H_ */

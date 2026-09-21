@@ -1,27 +1,20 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * H.264 CABAC 初始化表。
+ * H.264 CABAC initialization table.
  *
- * 逐字节取自上游 Linux 内核
- *   drivers/media/platform/verisilicon/hantro_h264.c
- * （commit 8ba098e6b6ff0db8edf28528d1552be261af30d4，SPDX GPL-2.0）
- * 上游注释说明该表来自
- *   drivers/media/platform/rk3288-vpu/rk3288_vpu_hw_h264d.c
- *   (chromiumos/third_party/kernel, chromeos-3.14 branch)
+ * Copied from Linux drivers/media/platform/verisilicon/hantro_h264.c,
+ * commit 8ba098e6b6ff0db8edf28528d1552be261af30d4, under GPL-2.0.
+ * The upstream table originated in the Chromium OS chromeos-3.14 kernel
+ * driver drivers/media/platform/rk3288-vpu/rk3288_vpu_hw_h264d.c.
  *
  * Copyright (c) 2014 Rockchip Electronics Co., Ltd.
- *	Hertz Wong <hertz.wong@rock-chips.com>
- *	Herman Chen <herman.chen@rock-chips.com>
+ *     Hertz Wong <hertz.wong@rock-chips.com>
+ *     Herman Chen <herman.chen@rock-chips.com>
  * Copyright (C) 2014 Google, Inc.
- *	Tomasz Figa <tfiga@chromium.org>
+ *     Tomasz Figa <tfiga@chromium.org>
  *
- * 这是 H.264 规范定义的 CABAC 上下文初始化常量，与具体 SoC 无关，
- * 因此可以直接用于 TH1520 的 VC8000D：硬件通过 QTABLE_BASE
- * （swreg40/140）读取本表所在的 DMA 缓冲。
- *
- * >>> 待硬件验证：本表的**排布顺序**是 Hantro/Rockchip G1 的约定。
- *     analysis 中没有直接证明 VC8000D 使用完全相同的排布；
- *     若 CABAC 码流解码结果异常，这里是第一个需要复核的地方。 <<<
+ * All 920 words retain the upstream order. CABAC streams were verified
+ * on the supported TH1520 build; see docs/validation.md and docs/sources.md.
  */
 
 #include <linux/types.h>
