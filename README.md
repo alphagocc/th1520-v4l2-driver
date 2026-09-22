@@ -115,15 +115,31 @@ v4l2-compliance -d /dev/video0 -m /dev/media0
 
 10 bit、4:2:2、4:4:4、H.264 场解码及 MBAFF 属于当前支持范围之外。SPS 尺寸
 需要与协商的缓冲尺寸一致；分辨率变化需要用户空间重新协商和分配缓冲。
-现有 4K 测试确认短序列输出正确，持续吞吐量和长时间运行仍需单独测量。
+现有 4K 测试确认短序列输出正确，4K 吞吐量和长时间运行仍需单独测量。
+1080p 的解码速度比较见 [benchmark 记录](docs/benchmark.md)。
 
 `test-containers.sh` 提供 H.264 MP4、HEVC Matroska 以及两组分辨率变化检查。
-脚本本地检查完成，四项板端验证尚未执行。生成前述 fixtures 和两个矩阵后，
-入口为：
+2026-09-22 四项板端测试全部通过，共 70 帧与软件参考逐字节相同。
+H.264 的三段尺寸为 320×240、640×360、1920×1080，HEVC 为
+320×240、1280×720、1920×1080。生成前述 fixtures 和两个矩阵后，入口为：
 
 ```sh
 sh tools/test-containers.sh "$PWD" test-results/containers
 ```
+
+解码速度比较由 `tools/benchmark-decode.sh` 提供，使用相同输入比较 GStreamer
+V4L2 stateless 硬件解码与 FFmpeg 软件解码，记录多轮帧率及 CPU 用量。
+输入生成、计时范围与执行命令见 [benchmark 说明](docs/benchmark.md)。
+
+GStreamer 1.22.0 的 HEVC 裁剪性能修复使 1080p 从 6.86 fps 提高到
+109.22 fps，像素和分辨率变化回归通过。修复插件仅在项目目录构建，使用
+`tools/with-gst-crop.sh` 为单次命令启用；详见
+[性能修复说明](docs/gstreamer-performance.md)。
+
+用户提供的 FFmpeg 8.1 `v4l2-request-n8.1` 客户端也通过板端硬解检查。
+1080p 每份 600 帧，三轮中位数为 H.264 326.40 fps、HEVC 415.05 fps；
+三项短样本共 28 帧与软件逐字节相同。临时构建与 Request 选择方式见
+[FFmpeg Request 说明](docs/ffmpeg-request.md)。
 
 watchdog 故障注入专项尚未运行。IRQ 与 watchdog 的作业完成权通过代码审查，
 该项状态与截断码流恢复测试分别记录在 [验证记录](docs/validation.md)。

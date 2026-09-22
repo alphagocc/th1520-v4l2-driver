@@ -1,0 +1,34 @@
+Subject: [PATCH] v4l2codecs: allow the video converter fast path for HEVC cropping
+
+Base: GStreamer tag 1.22.0
+Base-commit: f13c65d977b740b5955343d320dcf2061bbdf62d
+Source: https://github.com/GStreamer/gstreamer/blob/1.22.0/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c
+SPDX-License-Identifier: LGPL-2.0-or-later
+Upstream copyright: 2020 Nicolas Dufresne <nicolas.dufresne@collabora.com>
+Upstream copyright: 2020 Safran Passenger Innovations LLC
+
+The crop converter disables dithering but sets its quantization to zero.
+GstVideoConverter only considers fast paths when quantization is one, its
+default. Restore that value so an NV12 crop can use the existing plane-copy
+implementation instead of unpacking and repacking every pixel. Keep the
+crop rectangle, output dimensions and disabled dithering unchanged.
+
+This is a local one-line fix, not a backport of the later upstream change
+e7be87b3de56e8c9922359c410b5c17864cbbf29, which avoids the crop converter
+when the conformance window starts at the top-left corner.
+---
+ subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c b/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c
+--- a/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c
++++ b/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2codech265dec.c
+@@ -1098,7 +1098,7 @@ gst_v4l2_codec_h265_dec_crop_output_buffer (GstV4l2CodecH265Dec * self,
+             GST_VIDEO_CONVERTER_OPT_DITHER_METHOD,
+             GST_TYPE_VIDEO_DITHER_METHOD, GST_VIDEO_DITHER_NONE,
+             GST_VIDEO_CONVERTER_OPT_DITHER_QUANTIZATION,
+-            G_TYPE_UINT, 0,
++            G_TYPE_UINT, 1,
+             GST_VIDEO_CONVERTER_OPT_CHROMA_MODE,
+             GST_TYPE_VIDEO_CHROMA_MODE, GST_VIDEO_CHROMA_MODE_NONE,
+             GST_VIDEO_CONVERTER_OPT_MATRIX_MODE,

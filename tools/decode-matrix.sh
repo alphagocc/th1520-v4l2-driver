@@ -171,7 +171,9 @@ def sha256(path, deadline):
 def software_command(ffmpeg, sample, codec, reference, metadata, provided):
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-xerror", "-hwaccel", "none", "-c:v", codec, "-f", codec,
+        # Preserve exact conformance-window offsets. Without UNALIGNED,
+        # FFmpeg may round a small left crop down to its SIMD alignment.
+        "-xerror", "-hwaccel", "none", "-c:v", codec, "-flags", "+unaligned", "-f", codec,
         "-i", str(sample),
     ]
     output_options = [
