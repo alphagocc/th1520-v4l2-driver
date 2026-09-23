@@ -1,167 +1,181 @@
-# TH1520 VC8000D V4L2 stateless 解码驱动
+# TH1520 VC8000D V4L2 解码驱动
 
-`th1520-vdec.ko` 为 TH1520 的 VC8000D 解码核提供 Linux V4L2 memory-to-memory
-接口，使用 stateless decoder 与 Media Request API。用户空间负责码流解析和
-DPB 管理，驱动执行硬件解码并输出线性 NV12。
+`th1520-vdec.ko` 为 TH1520 的 VC8000D 提供 Linux V4L2 stateless 解码接口，
+支持 H.264、HEVC 和 VP9，输出线性 NV12。用户空间通过 Media Request API
+提交解析后的帧参数并管理参考帧，驱动负责硬件解码、缓冲区和任务调度。
 
-VP9 Profile 0、8 bit、4:2:0 后端采用 `V4L2_PIX_FMT_VP9_FRAME` 和两项标准
-VP9 Request 控件，13 组板端样本共 190 个显示帧与软件逐字节相同，覆盖至
-1920×1080，并通过截断帧与 watchdog 后的关键帧恢复检查。
-支持范围、内存布局和来源见 [VP9 说明](docs/vp9.md)，检查结果见
-[VP9 验证记录](docs/vp9-validation.md)。
+**日常解码与性能测量优先使用支持 V4L2 Request API 的 FFmpeg。** 本项目
+验证过的客户端为 FFmpeg 8.1 的 `v4l2-request-n8.1` 分支。以下示例统一使用
+包含 H.264、HEVC、VP9 的构建，GStreamer 和底层接口测试见文末说明。
 
-同源 FFmpeg 8.1 增补 VP9 Request 后，1080p 600 帧三轮中位数为硬件
-224.01 fps、四线程软件 68.94 fps。输入、CPU 用量及测量条件见
-[VP9 benchmark](docs/vp9-benchmark.md)。
+## 支持范围
 
-H.264 与 HEVC 经过板端测试的范围为逐行、8 bit、4:2:0 的 H.264 Baseline、Main、High 以及 HEVC
-Main、Main Still Picture。OUTPUT 格式为 `V4L2_PIX_FMT_H264_SLICE` 或
-`V4L2_PIX_FMT_HEVC_SLICE`，使用 Annex-B、每个请求提交完整帧；CAPTURE 格式为
-`V4L2_PIX_FMT_NV12`。当前尺寸上限为 4096×2304，硬件测试覆盖至 3840×2160。
+| 编码 | Profile | 图像格式 | 板端像素测试覆盖 |
+| --- | --- | --- | --- |
+| H.264 | Baseline、Main、High | 逐行、8 bit、4:2:0 | 至 3840×2160 |
+| HEVC | Main、Main Still Picture | 逐行、8 bit、4:2:0 | 至 3840×2160 |
+| VP9 | Profile 0 | 8 bit、4:2:0，宽高为偶数 | 至 1920×1080 |
 
-## 硬件验证状态
+驱动允许的最大缓冲尺寸为 4096×2304，CAPTURE 格式为 NV12。表中的尺寸表示
+实际像素测试范围；VP9 的更大尺寸以及各编码的长期运行仍需单独验证。
+分辨率变化由客户端重新协商缓冲格式和容量。
 
-2026-09-21 至 2026-09-22，在 TH1520、RevyOS、Linux `6.6.140-th1520` 上完成
-30 个合法样本、1020 帧的完整输出检查。ASIC ID 为 `0x80018000`，build ID
-为 `0x1f88`。
+验证环境为 TH1520、RevyOS、Linux `6.6.140-th1520`。平台资源、设备树和
+内核兼容要求见 [硬件说明](docs/hardware.md)，VP9 的具体约束见
+[VP9 实现说明](docs/vp9.md)。
 
-| 样本组 | 样本数 | 帧数 | 比较结果 |
-| --- | ---: | ---: | --- |
-| H.264 测试矩阵 | 15 | 196 | 全部与软件逐字节相同 |
-| 自生成 HEVC 测试矩阵 | 9 | 85 | 8 个软件一致，1 个厂商一致 |
-| 官方 HEVC conformance | 6 | 739 | 5 个软件一致，1 个 SDK 尺寸范围外附加测试 |
-| 合计 | **30** | **1020** | **28 个软件一致，1 个厂商一致，1 个范围外附加测试** |
+寄存器地址、位域、各编码模式的参数及 PP 配置见
+[VC8000D 寄存器指南](docs/swreg.md)。
 
-`v4l2-compliance 1.28.1` 共 **56/56** 项通过，失败 0、警告 0。混合 H.264
-与 HEVC 的两个 context，以及 Request API 的 2 worker、10 轮检查通过。
-测试方法、覆盖范围和两个 HEVC 差异样本见 [验证记录](docs/validation.md)。
+## 准备运行环境
 
-## 构建与临时加载
+以下命令在开发板的驱动仓库目录执行，该目录包含 `Kbuild` 和 `tools/`。
+需要 C 编译器、GNU make、curl、pkg-config、Python 3、v4l-utils，以及与
+运行内核匹配的头文件。运行 FFmpeg 的账户须有 `/dev/videoN` 和 `/dev/mediaN`
+的读写权限，设备编号以驱动加载后的输出为准。
 
-在本仓库根目录执行。构建需要 `make`、C 编译器、`curl` 和与运行内核匹配的
-内核头文件。经过验证的 RevyOS 头文件目录为：
+### 构建并加载驱动
 
 ```sh
 KDIR=/usr/src/linux-headers-6.6-th1520 JOBS=4 sh tools/board-build.sh
 sudo sh tools/board-load.sh
 ```
 
-`board-build.sh` 检查头文件的 `kernel.release` 与 `uname -r`。目标 RevyOS
-内核缺少 codec helper，脚本从 kernel.org 获取匹配版本的 Linux GPL 源文件，
-在 `build/helpers-<kernel-release>/` 编译 `v4l2-mem2mem`、`v4l2-h264` 和 `v4l2-vp9`
-模块，再构建驱动；`SOURCES` 记录下载地址。
+`board-build.sh` 核对头文件版本与 `uname -r`，从 Linux stable 获取匹配版本的
+`v4l2-mem2mem`、`v4l2-h264`、`v4l2-vp9` helper，在项目目录编译这些模块和
+驱动，并记录源码地址与校验值。
 
-加载前应关闭占用解码设备的程序。`board-load.sh` 在当前启动期间卸载原解码
-模块，装载媒体依赖、三个 helper 和 `th1520-vdec.ko`，最后显示设备编号。
-模块与构建产物保存在工作目录，开机配置保持原样；重启后沿用系统原有的加载
-配置。再次测试时重新执行 `board-load.sh`。
+加载脚本会卸载原解码模块，因此执行前应关闭使用 VPU 的程序。新模块仅在
+本次启动期间加载，重启后沿用系统原有配置。加载成功后会列出对应的 video
+设备和 media 设备。
 
-目标设备树使用 `xuantie,th1520-vc8000d` 或 `thead,light-vc8000d`，`reg`
-描述 VPU 子系统，驱动增加解码核偏移 `0x1000`。经过验证的开发板使用现有
-设备树节点。平台资源与硬件配置见 [硬件说明](docs/hardware.md)。
+### 准备 FFmpeg
 
-## 解码与像素比较
+FFmpeg 源码压缩包来自
+[Kwiboo FFmpeg 的 v4l2-request-n8.1 分支](https://code.ffmpeg.org/Kwiboo/FFmpeg/src/branch/v4l2-request-n8.1)。
+从该页面下载 ZIP，按 [源码与依赖准备说明](docs/ffmpeg-request.md)核对压缩包
+SHA-256，并在 `build/ffmpeg-request-runtime/sysroot` 准备匹配系统运行库的
+libdrm、libudev 开发文件。构建脚本使用本次测试压缩包的固定校验值；分支内容
+更新后，新下载的压缩包需要重新核对版本和构建条件。
 
-生成样本需要带 `libx264`、`libx265` 的 FFmpeg 和 Python 3。板端需要
-GStreamer 的 `h264parse`、`h265parse`、`videoconvert` 及 `v4l2codecs` 插件，
-以及 `cmp`、`timeout`、`sha256sum`。加载驱动后检查硬件元素：
-
-```sh
-gst-inspect-1.0 v4l2slh264dec
-gst-inspect-1.0 v4l2slh265dec
-```
-
-基础样本、混合 context 与 Request API 回归：
+将压缩包保存为 `build/FFmpeg-v4l2-request-n8.1.zip` 后执行：
 
 ```sh
-sh tools/make-fixtures.sh test-results/fixtures
-sh tools/board-test.sh test-results
+JOBS=2 sh tools/build-ffmpeg-request.sh build/FFmpeg-v4l2-request-n8.1.zip
+JOBS=2 sh tools/build-ffmpeg-vp9-request.sh "$PWD"
+
+FFMPEG="$PWD/build/ffmpeg-request-vp9/ffmpeg"
+"$FFMPEG" -hide_banner -hwaccels
+"$FFMPEG" -hide_banner -decoders
 ```
 
-完整测试矩阵与官方样本：
+第一步生成 H.264、HEVC 构建；第二步复用其源码、配置和依赖，在独立目录加入
+VP9。后续统一使用 `build/ffmpeg-request-vp9/ffmpeg`。构建保留在项目目录，
+具体配置与来源记录见 [FFmpeg VP9 Request 构建说明](docs/ffmpeg-vp9-request.md)。
+
+使用现有 FFmpeg 时，将 `FFMPEG` 指向对应程序。`-hwaccels` 输出应包含
+`v4l2request`，`-decoders` 应包含需要的 `h264`、`hevc` 或 `vp9`。
+实际硬件选择还须通过解码日志确认，方法见下一节。
+
+## 使用 FFmpeg 解码
+
+通过 `-hwaccel v4l2request` 选择硬件加速，输入解码器仍使用普通的编码名称：
+
+| 编码 | `-c:v` 参数 | 示例输入 |
+| --- | --- | --- |
+| H.264 | `h264` | `input.h264` |
+| HEVC | `hevc` | `input.h265` |
+| VP9 | `vp9` | `input.ivf` |
+
+以下以 VP9 为例。处理其他编码时，修改 `CODEC` 和 `INPUT`。该 FFmpeg 构建
+同时支持 MP4、Matroska 和 WebM 容器，输入格式由 FFmpeg 自动探测。
 
 ```sh
-sh tools/make-h264-matrix.sh test-results/h264-matrix
-sh tools/decode-matrix.sh test-results/h264-matrix test-results/h264-matrix-results --timeout 300
+CODEC=vp9
+INPUT=input.ivf
 
-sh tools/make-hevc-matrix.sh test-results/hevc-matrix
-sh tools/decode-matrix.sh test-results/hevc-matrix test-results/hevc-matrix-results --timeout 300
-
-sh tools/fetch-hevc-conformance.sh
-sh tools/decode-matrix.sh test-results/hevc-conformance test-results/hevc-conformance-results --timeout 300
+"$FFMPEG" -hide_banner -loglevel verbose \
+  -hwaccel v4l2request -hwaccel_output_format drm_prime \
+  -c:v "$CODEC" -threads 1 -i "$INPUT" \
+  -map 0:v:0 -an -sn -dn -fps_mode passthrough \
+  -c:v wrapped_avframe -pix_fmt +drm_prime \
+  -f null - -progress pipe:1
 ```
 
-H.264 脚本核查实际码流特征，参数见 [H.264 矩阵说明](tools/h264-matrix.md)。
-HEVC 脚本保存编码参数、日志、header trace 和软件 NV12；官方样本按固定大小
-与 SHA-256 下载，来源见 [HEVC conformance 样本](docs/hevc-conformance-samples.md)。
+此命令保留 DRM 硬件帧并送往 null 输出，适合检查硬件解码和测量吞吐量。
+`+drm_prime` 要求输出保持硬件帧格式。日志应显示选中的 media driver 为
+`th1520-vdec`，CAPTURE 格式为 NV12，例如：
 
-软件基准显式选择 FFmpeg 的 `h264` 或 `hevc` decoder。硬件使用 GStreamer
-stateless 元素，处理输出行距后比较全部 NV12 字节。`decode-matrix.sh` 保存
-`summary.json`、`summary.tsv` 和逐例日志；现有 `.sw.nv12` 可作为软件参考。
-两个保留差异的 HEVC 样本仍得到 `cmp=different` 和退出码 1，详细解释见
-[HEVC 输出差异](docs/hevc-vendor-comparison.md)。
+```text
+Using V4L2 media driver th1520-vdec (...) for VP9F
+Using CAPTURE buffer format NV12 (1920x1088)
+```
 
-## Request API 与合规检查
+正常结束时应返回退出码 0，并输出完整帧数和 `progress=end`。
+CAPTURE 存储高度可能包含补齐行，例如 1080 行图像使用 1088 行缓冲；
+客户端依据帧参数处理可见图像区域。
 
-`request-test.c` 生成 64×64 的 H.264 Baseline I_PCM 图像，提交 Media Request
-并检查输出像素。设备编号以加载脚本的输出为准：
+### 导出 NV12 图像
+
+需要保存图像或进行像素比较时，使用 `hwdownload` 下载硬件帧：
 
 ```sh
-mkdir -p build
-cc -std=c11 -O2 -Wall -Wextra -Werror -o build/request-test tools/request-test.c
-./build/request-test --device /dev/video0 --media /dev/media0
-./build/request-test --workers 2 --iterations 10 --data-offset 13 --malformed
-./build/request-test --invalid-hevc-params
-
-v4l2-compliance --version
-v4l2-compliance -d /dev/video0 -m /dev/media0
+"$FFMPEG" -hide_banner -loglevel verbose \
+  -hwaccel v4l2request -hwaccel_output_format drm_prime \
+  -c:v "$CODEC" -threads 1 -i "$INPUT" \
+  -map 0:v:0 -an -sn -dn -fps_mode passthrough \
+  -vf hwdownload,format=nv12 \
+  -c:v rawvideo -pix_fmt nv12 -f rawvideo output.nv12
 ```
 
-`--malformed` 依次提交正常帧、截断帧与恢复帧，检查完成状态及恢复后的像素。
-`--invalid-hevc-params` 检查七种异常 HEVC 控件。合规结果的比较基准为
-`v4l2-compliance 1.28.1`，执行前应确认工具版本。
+`output.nv12` 为无容器的原始图像序列，读取时需要指定可见宽高。
+图像下载和文件写入会增加处理时间，纯解码吞吐量使用前一节的 DRM 帧与 null
+输出方式测量。
 
-## 当前边界与后续验证
+## 性能测量
 
-10 bit、4:2:2、4:4:4、H.264 场解码及 MBAFF 属于当前支持范围之外。SPS 尺寸
-需要与协商的缓冲尺寸一致；分辨率变化需要用户空间重新协商和分配缓冲。
-现有 4K 测试确认短序列输出正确，4K 吞吐量和长时间运行仍需单独测量。
-1080p 的解码速度比较见 [benchmark 记录](docs/benchmark.md)。
+下表为板端 FFmpeg V4L2 Request 的 1080p 测量结果。每份输入为连续 600 帧，
+预热后执行三轮，表中列出硬件解码帧率的中位数。各编码使用各自的测试输入，
+详细参数、驱动版本和测量条件见对应报告。
 
-`test-containers.sh` 提供 H.264 MP4、HEVC Matroska 以及两组分辨率变化检查。
-2026-09-22 四项板端测试全部通过，共 70 帧与软件参考逐字节相同。
-H.264 的三段尺寸为 320×240、640×360、1920×1080，HEVC 为
-320×240、1280×720、1920×1080。生成前述 fixtures 和两个矩阵后，入口为：
+| 编码 | 硬件解码帧率 | 报告 |
+| --- | ---: | --- |
+| H.264 | 326.40 fps | [FFmpeg Request 测试](docs/ffmpeg-request.md) |
+| HEVC | 415.05 fps | [FFmpeg Request 测试](docs/ffmpeg-request.md) |
+| VP9 | 224.01 fps | [VP9 benchmark](docs/vp9-benchmark.md) |
+
+VP9 同一构建的四线程软件解码为 68.94 fps。进程 CPU 用量中位数为硬件
+28.5%、软件 357.8%，100% 表示一个逻辑核心。测试构建保留 `--disable-asm`，
+软件性能应按这一编译配置解读。
+
+VP9 输入生成及测量入口为：
 
 ```sh
-sh tools/test-containers.sh "$PWD" test-results/containers
+sh tools/make-vp9-benchmark.sh test-results/vp9-benchmark
+python3 tools/benchmark-vp9-request.py \
+  --ffmpeg "$FFMPEG" \
+  --input test-results/vp9-benchmark/vp9-1920x1080.ivf \
+  --output test-results/vp9-benchmark-results \
+  --frames 600 --rounds 3 --software-threads 4
 ```
 
-解码速度比较由 `tools/benchmark-decode.sh` 提供，使用相同输入比较 GStreamer
-V4L2 stateless 硬件解码与 FFmpeg 软件解码，记录多轮帧率及 CPU 用量。
-输入生成、计时范围与执行命令见 [benchmark 说明](docs/benchmark.md)。
+生成输入需要带 `libvpx-vp9` 编码器和 `trace_headers` 的 FFmpeg、ffprobe。
+可以在另一台计算机生成后传送到开发板。每次测量使用独立的结果目录，工具保存
+逐轮命令、日志、帧数、耗时、CPU 用量和 JSON 汇总。
 
-GStreamer 1.22.0 的 HEVC 裁剪性能修复使 1080p 从 6.86 fps 提高到
-109.22 fps，像素和分辨率变化回归通过。修复插件仅在项目目录构建，使用
-`tools/with-gst-crop.sh` 为单次命令启用；详见
-[性能修复说明](docs/gstreamer-performance.md)。
+## 验证与其他客户端
 
-用户提供的 FFmpeg 8.1 `v4l2-request-n8.1` 客户端也通过板端硬解检查。
-1080p 每份 600 帧，三轮中位数为 H.264 326.40 fps、HEVC 415.05 fps；
-三项短样本共 28 帧与软件逐字节相同。临时构建与 Request 选择方式见
-[FFmpeg Request 说明](docs/ffmpeg-request.md)。
+`v4l2-compliance 1.28.1` 的 56 项检查通过，失败 0、警告 0。H.264、HEVC 的
+像素测试、容器与分辨率变化，以及保留差异的 HEVC 样本见
+[验证记录](docs/validation.md)。VP9 的 198 帧像素比较、230 项异常请求、
+并发和错误恢复结果见 [VP9 验证记录](docs/vp9-validation.md)。
 
-当前 MMIO 使用标准 `readl()`、`writel()`。此前 relaxed MMIO 的 6000 帧
-交替比较仅观察到约 0.2–0.3% 的吞吐量增加。
-像素、并发、合规和独立 watchdog 故障注入后的恢复检查通过，详见
-[MMIO 验证](docs/mmio-performance.md) 与 [验证记录](docs/validation.md)。
+GStreamer 可用于应用集成和项目测试矩阵，硬件解码元素为
+`v4l2slh264dec`、`v4l2slh265dec`、`v4l2slvp9dec`。现有
+`tools/decode-matrix.sh` 使用这些元素执行像素比较；GStreamer 1.22 的 HEVC
+裁剪处理说明见 [GStreamer 性能记录](docs/gstreamer-performance.md)。
 
-## 文档与上游接口
-
-本仓库包含构建、加载和验证所需脚本，硬件参数见
-[硬件说明](docs/hardware.md)，上游来源与许可证说明见
-[来源记录](docs/sources.md)。测试样本与构建产物由脚本生成或下载。
-
-Linux 接口采用公开的
-[V4L2 stateless decoder 规范](https://docs.kernel.org/6.6/userspace-api/media/v4l/dev-stateless-decoder.html)
-和 [Media Request API](https://docs.kernel.org/6.6/userspace-api/media/mediactl/request-api.html)。
+控件、Request 生命周期、截断帧和 watchdog 检查的入口汇总在
+[工具说明](tools/README.md)。相关实现采用公开的 V4L2 stateless decoder
+和 Media Request API，源码依据、固定上游版本及许可证见
+[来源记录](docs/sources.md)。

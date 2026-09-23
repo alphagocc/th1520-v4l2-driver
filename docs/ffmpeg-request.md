@@ -101,7 +101,7 @@ INPUT="$ROOT/test-results/benchmark-fixtures/hevc-1920x1080.h265"
 
 H.264 测试将输入 codec 和 demuxer 两处 `hevc` 改为 `h264`，并选择对应
 1080p 文件。输出使用 `+drm_prime` 强制保留硬件格式，验证日志应确认
-选中的 media 设备属于 `th1520_vdec`，CAPTURE 格式为 NV12，并核对完整
+选中的 media driver 为 `th1520-vdec`，CAPTURE 格式为 NV12，并核对完整
 帧数和最终 `progress=end`。测试使用 1080p 输入。
 
 该分支的设备选择仍自动枚举 media 设备；源码
