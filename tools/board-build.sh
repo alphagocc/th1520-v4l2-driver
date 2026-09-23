@@ -26,17 +26,18 @@ HELPERS="$DRIVER_DIR/build/helpers-$RELEASE"
 mkdir -p "$HELPERS"
 TAG="v${RELEASE%-th1520}"
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/v4l2-core"
-for NAME in v4l2-mem2mem v4l2-h264; do
+for NAME in v4l2-mem2mem v4l2-h264 v4l2-vp9; do
     if [ ! -s "$HELPERS/$NAME.c" ]; then
         curl --fail --silent --show-error --location --retry 2 \
             --connect-timeout 15 --max-time 60 \
             "$BASE/$NAME.c?h=$TAG" -o "$HELPERS/$NAME.c"
     fi
 done
-printf 'obj-m += v4l2-mem2mem.o\nobj-m += v4l2-h264.o\n' > "$HELPERS/Kbuild"
-printf '%s\n' "$BASE/v4l2-mem2mem.c?h=$TAG" "$BASE/v4l2-h264.c?h=$TAG" > "$HELPERS/SOURCES"
+printf 'obj-m += v4l2-mem2mem.o\nobj-m += v4l2-h264.o\nobj-m += v4l2-vp9.o\n' > "$HELPERS/Kbuild"
+printf '%s\n' "$BASE/v4l2-mem2mem.c?h=$TAG" "$BASE/v4l2-h264.c?h=$TAG" \
+    "$BASE/v4l2-vp9.c?h=$TAG" > "$HELPERS/SOURCES"
 make -C "$KDIR" M="$HELPERS" -j"$JOBS" modules
 make -C "$DRIVER_DIR" KDIR="$KDIR" \
     KBUILD_EXTRA_SYMBOLS="$HELPERS/Module.symvers" -j"$JOBS" modules
 sha256sum "$DRIVER_DIR/th1520-vdec.ko" \
-    "$HELPERS/v4l2-mem2mem.c" "$HELPERS/v4l2-h264.c"
+    "$HELPERS/v4l2-mem2mem.c" "$HELPERS/v4l2-h264.c" "$HELPERS/v4l2-vp9.c"

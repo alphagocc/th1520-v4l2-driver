@@ -1,10 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# Decode regular *.h264/*.h265 samples through V4L2 and compare every NV12 byte.
+# Decode *.h264, *.h265 and VP9 *.ivf samples and compare every NV12 byte.
 # Usage: sh tools/decode-matrix.sh INPUT_DIR [RESULT_DIR] [--timeout 60]
 # Requires python3, ffmpeg, gst-launch-1.0 and cmp. Installs or loads nothing.
 # Existing NAME.EXT.sw.nv12 or NAME.sw.nv12 references are read-only inputs.
-# The software decoder is always explicit: ffmpeg -hwaccel none -c:v h264/hevc.
+# The software decoder is explicit: ffmpeg -hwaccel none -c:v h264/hevc/vp9.
 # A shared per-case deadline covers reference preparation, hardware decoding,
 # packing, comparison and hashing; process termination adds at most 3 seconds.
 # summary.json is an array of case records; summary.tsv contains the same fields.
@@ -111,9 +111,9 @@ def frame_metadata(path):
     if not dimensions or not sizes:
         raise CaseFailure("software decoder produced no frame dimensions/samples")
     width, height = dimensions
-    if not width or not height or width % 2 or height % 2:
-        raise CaseFailure("comparison requires positive even NV12 dimensions")
-    frame_bytes = width * height * 3 // 2
+    if not width or not height:
+        raise CaseFailure("comparison requires positive NV12 dimensions")
+    frame_bytes = width * height + ((width + 1) // 2) * 2 * ((height + 1) // 2)
     if any(size != frame_bytes for size in sizes):
         raise CaseFailure("software frame sizes do not match a fixed NV12 layout")
     return width, height, len(sizes), frame_bytes
@@ -121,10 +121,14 @@ def frame_metadata(path):
 
 def normalize_nv12(source, target, width, height, deadline, log_path):
     # The two videoconvert elements remove decoder GstVideoMeta padding.
-    # Ordinary GStreamer NV12 can still round the row stride to four bytes;
-    # strip that remaining padding for an exact FFmpeg rawvideo comparison.
+    # GStreamer NV12 rounds row stride to four bytes and luma height to two.
+    # FFmpeg rawvideo packs Y at width and UV at 2 * ceil(width / 2).
+    # See gst-plugins-base/gst-libs/gst/video/video-info.c:fill_planes().
     stride = (width + 3) & ~3
-    gst_frame_bytes = stride * height * 3 // 2
+    luma_height = (height + 1) & ~1
+    chroma_height = (height + 1) // 2
+    chroma_width = (width + 1) & ~1
+    gst_frame_bytes = stride * (luma_height + chroma_height)
     size = source.stat().st_size
     if not size or size % gst_frame_bytes:
         raise CaseFailure(
@@ -133,7 +137,7 @@ def normalize_nv12(source, target, width, height, deadline, log_path):
         )
     frames = size // gst_frame_bytes
     with source.open("rb") as src, target.open("wb") as dst:
-        if stride == width:
+        if stride == width and height == luma_height:
             while True:
                 remaining(deadline)
                 block = src.read(1024 * 1024)
@@ -143,11 +147,17 @@ def normalize_nv12(source, target, width, height, deadline, log_path):
         else:
             for _ in range(frames):
                 remaining(deadline)
-                for _ in range(height * 3 // 2):
+                for _ in range(height):
                     row = src.read(stride)
                     if len(row) != stride:
                         raise CaseFailure("short read while packing GStreamer NV12")
                     dst.write(row[:width])
+                src.seek(stride * (luma_height - height), os.SEEK_CUR)
+                for _ in range(chroma_height):
+                    row = src.read(stride)
+                    if len(row) != stride:
+                        raise CaseFailure("short read while packing GStreamer NV12 chroma")
+                    dst.write(row[:chroma_width])
     log_path.write_text(
         f"width={width} height={height} gst_stride={stride} "
         f"frames={frames} gst_bytes={size} packed_bytes={target.stat().st_size}\n",
@@ -169,11 +179,12 @@ def sha256(path, deadline):
 
 
 def software_command(ffmpeg, sample, codec, reference, metadata, provided):
+    demuxer = "ivf" if codec == "vp9" else codec
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         # Preserve exact conformance-window offsets. Without UNALIGNED,
         # FFmpeg may round a small left crop down to its SIMD alignment.
-        "-xerror", "-hwaccel", "none", "-c:v", codec, "-flags", "+unaligned", "-f", codec,
+        "-xerror", "-hwaccel", "none", "-c:v", codec, "-flags", "+unaligned", "-f", demuxer,
         "-i", str(sample),
     ]
     output_options = [
@@ -194,9 +205,11 @@ def software_command(ffmpeg, sample, codec, reference, metadata, provided):
 def decode_case(sample, number, results, timeout, commands, environment):
     started = time.monotonic()
     deadline = started + timeout
-    codec = "h264" if sample.suffix == ".h264" else "hevc"
-    parser = "h264parse" if codec == "h264" else "h265parse"
-    decoder = "v4l2slh264dec" if codec == "h264" else "v4l2slh265dec"
+    codec, parsers, decoder = {
+        ".h264": ("h264", ["h264parse"], "v4l2slh264dec"),
+        ".h265": ("hevc", ["h265parse"], "v4l2slh265dec"),
+        ".ivf": ("vp9", ["ivfparse", "vp9parse"], "v4l2slvp9dec"),
+    }[sample.suffix]
     label = re.sub(r"[^A-Za-z0-9_.-]", "_", sample.name)[:80]
     case_dir = Path(tempfile.mkdtemp(prefix=f"{number:04d}-{label}-", dir=results))
     raw_hw = case_dir / "hardware.gst.nv12"
@@ -223,6 +236,11 @@ def decode_case(sample, number, results, timeout, commands, environment):
         "timeout_seconds": timeout, "duration_ms": None, "errors": [],
     }
     try:
+        if codec == "vp9":
+            with sample.open("rb") as stream:
+                header = stream.read(12)
+            if header[:4] != b"DKIF" or header[8:12] != b"VP90":
+                raise CaseFailure("IVF input must contain VP9 video with a DKIF/VP90 header")
         row["software_rc"] = run_command(
             software_command(commands["ffmpeg"], sample, codec, reference,
                              metadata, provided),
@@ -244,9 +262,11 @@ def decode_case(sample, number, results, timeout, commands, environment):
 
         # This is the board-test.sh packing sequence, with explicit V4L2
         # decoder elements and no decodebin/software fallback.
-        pipeline = [
-            commands["gst-launch-1.0"], "-q", "filesrc", f"location={sample}",
-            "!", parser, "!", "identity", "sleep-time=1000", "!", decoder,
+        pipeline = [commands["gst-launch-1.0"], "-q", "filesrc", f"location={sample}"]
+        for element in parsers:
+            pipeline += ["!", element]
+        pipeline += [
+            "!", "identity", "sleep-time=1000", "!", decoder,
             "!", "videoconvert", "!", "video/x-raw,format=I420",
             "!", "videoconvert", "!", "video/x-raw,format=NV12",
             "!", "filesink", f"location={raw_hw}",
@@ -304,7 +324,7 @@ def write_summaries(results, rows):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare legal H.264/HEVC files through V4L2 and explicit software decoding."
+        description="Compare H.264, HEVC and VP9 IVF through V4L2 and explicit software decoding."
     )
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("result_dir", type=Path, nargs="?")
@@ -317,11 +337,11 @@ def main():
     if not source.is_dir():
         parser.error("input_dir must be an existing directory")
     samples = sorted(
-        [path for pattern in ("*.h264", "*.h265") for path in source.glob(pattern)
+        [path for pattern in ("*.h264", "*.h265", "*.ivf") for path in source.glob(pattern)
          if path.is_file()], key=lambda path: path.name,
     )
     if not samples:
-        parser.error("input_dir contains no .h264 or .h265 files")
+        parser.error("input_dir contains no .h264, .h265 or .ivf files")
     commands = {name: shutil.which(name) for name in ("ffmpeg", "gst-launch-1.0", "cmp")}
     missing = [name for name, command in commands.items() if command is None]
     if missing:

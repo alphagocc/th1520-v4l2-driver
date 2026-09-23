@@ -13,6 +13,15 @@
 | `make-fixtures.sh` | 生成基础 H.264、HEVC 码流和软件解码基准 |
 | `make-h264-matrix.sh` | 生成并检查 H.264 profile、参考帧、slice 等组合，详见 [测试矩阵](h264-matrix.md) |
 | `make-hevc-matrix.sh` | 生成不同尺寸与编码特征的 HEVC 样本 |
+| `make-vp9-matrix.sh` | 生成 VP9 Profile 0 IVF、软件 NV12，并核对实际帧头；见 [VP9 验证记录](../docs/vp9-validation.md) |
+| `make-vp9-extra.sh` | 生成串行概率更新、alt-ref、superframe、show-existing 和非整块尺寸样本 |
+| `make-vp9-benchmark.sh` | 生成 1080p 600 帧连续 VP9 输入及同源前八帧参考 |
+| `build-ffmpeg-vp9-request.sh` | 从原 FFmpeg 8.1 源码在独立目录增补 VP9 Request 支持 |
+| `benchmark-vp9-request.py` | 对同一输入预热并交替测量 FFmpeg Request 与软件解码 |
+| `vp9-request-test.c` | 验证异常控件、请求完成、REINIT 和 STREAMOFF |
+| `vp9-decode-test.c` | 重放真实关键帧控件，检查截断及 watchdog 后同 context 像素恢复 |
+| `vp9-offline-test.py` | 使用指定 Linux 源码在本机检查真实概率转换代码，启用 ASan 和 UBSan |
+| `vp9-backend-test.py` | 使用模拟 DMA、VB2 和寄存器检查真实 VP9 后端的边界与分配失败处理 |
 | `fetch-hevc-conformance.sh` | 从 FFmpeg FATE 官方服务下载选定样本与固定版本的预期结果 |
 | `decode-matrix.sh` | 对指定目录的码流执行 V4L2 解码和像素比较 |
 | `test-containers.sh` | 检查 MP4、Matroska 和三段 CVS 分辨率变化 |

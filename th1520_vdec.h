@@ -66,6 +66,7 @@
 #define TH1520_DPB_SIZE			16
 
 struct th1520_vdec_ctx;
+struct th1520_vdec_vp9_ctx;
 
 /**
  * struct th1520_vdec_aux_buf - 驱动私有的 DMA 辅助缓冲
@@ -79,17 +80,27 @@ struct th1520_vdec_aux_buf {
 /**
  * struct th1520_vdec_buffer - 队列缓冲及其私有原生参考帧
  * @m2m:      V4L2 M2M 队列缓冲
- * @native:   HEVC 原生帧及 direct-MV，随 CAPTURE 缓冲分配和释放
+ * @native:   codec 原生帧及 motion vectors，随 CAPTURE 缓冲分配和释放
+ * @vp9:      VP9 参考帧尺寸和原生布局，仅在成功完成解码后有效
  */
 struct th1520_vdec_buffer {
 	struct v4l2_m2m_buffer m2m;
 	struct th1520_vdec_aux_buf native;
+	struct {
+		u32 width;
+		u32 height;
+		u32 chroma_offset;
+		u32 mv_offset;
+		u32 stride;
+		bool valid;
+	} vp9;
 };
 
 enum th1520_vdec_codec_mode {
 	TH1520_MODE_NONE = -1,
 	TH1520_MODE_H264_DEC,
 	TH1520_MODE_HEVC_DEC,
+	TH1520_MODE_VP9_DEC,
 };
 
 /**
@@ -109,14 +120,18 @@ struct th1520_vdec_fmt {
  * @init:      分配 codec 私有资源（每个 ctx 一次）
  * @exit:      释放 codec 私有资源
  * @run:       把当前 request 的控件翻译成寄存器并启动硬件
+ * @check_result: 检查 codec 完成状态，返回零或错误码；在发布解码状态之前调用
  * @done:      一次解码成功完成后的收尾（可为 NULL）
+ * @abort:     作业失败或停止 streaming 后清除 codec 软件状态（可为 NULL）
  * @reset:     超时后复位硬件
  */
 struct th1520_vdec_codec_ops {
 	int (*init)(struct th1520_vdec_ctx *ctx);
 	void (*exit)(struct th1520_vdec_ctx *ctx);
 	int (*run)(struct th1520_vdec_ctx *ctx);
+	int (*check_result)(struct th1520_vdec_ctx *ctx, u32 irq_status);
 	void (*done)(struct th1520_vdec_ctx *ctx);
+	void (*abort)(struct th1520_vdec_ctx *ctx);
 	void (*reset)(struct th1520_vdec_ctx *ctx);
 };
 
@@ -132,6 +147,7 @@ struct th1520_vdec_codec_ops {
  * @reg_base:	 VC8000D 寄存器块的 ioremap 结果
  * @irq:	 解码中断
  * @vpu_mutex:	 保护 V4L2 设备级操作
+ * @run_mutex:	 串行化作业提交与 STREAMOFF 中止
  * @irqlock:	 保护活动作业、超时时间与中断状态
  * @watchdog_work: 软件超时处理
  * @active_ctx:   当前硬件作业；完成处理取得该指针后清零
@@ -156,6 +172,7 @@ struct th1520_vdec_dev {
 	int irq;
 
 	struct mutex vpu_mutex;	/* 串行化 V4L2 设备级操作 */
+	struct mutex run_mutex;	/* Prevent abort racing the final hardware start. */
 	spinlock_t irqlock;	/* Active job, deadline and IRQ status. */
 
 	struct delayed_work watchdog_work;
@@ -244,6 +261,7 @@ struct th1520_vdec_ctx {
 		struct th1520_vdec_h264_ctx h264;
 		struct th1520_vdec_hevc_ctx hevc;
 	};
+	struct th1520_vdec_vp9_ctx *vp9;
 };
 
 static inline struct th1520_vdec_ctx *fh_to_ctx(struct v4l2_fh *fh)
@@ -299,6 +317,8 @@ void th1520_vdec_reset_fmts(struct th1520_vdec_ctx *ctx);
 
 extern const struct th1520_vdec_codec_ops th1520_vdec_h264_ops;
 extern const struct th1520_vdec_codec_ops th1520_vdec_hevc_ops;
+extern const struct th1520_vdec_codec_ops th1520_vdec_vp9_ops;
+size_t th1520_vdec_vp9_native_size(const struct th1520_vdec_ctx *ctx);
 
 /* H.264 CABAC 初始化表，单位是 u32（th1520_vdec_h264_cabac.c） */
 #define TH1520_H264_CABAC_TABLE_LEN	(460 * 2)

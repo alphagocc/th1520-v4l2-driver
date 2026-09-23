@@ -4,7 +4,17 @@
 接口，使用 stateless decoder 与 Media Request API。用户空间负责码流解析和
 DPB 管理，驱动执行硬件解码并输出线性 NV12。
 
-当前支持范围为逐行、8 bit、4:2:0 的 H.264 Baseline、Main、High 以及 HEVC
+VP9 Profile 0、8 bit、4:2:0 后端采用 `V4L2_PIX_FMT_VP9_FRAME` 和两项标准
+VP9 Request 控件，13 组板端样本共 190 个显示帧与软件逐字节相同，覆盖至
+1920×1080，并通过截断帧与 watchdog 后的关键帧恢复检查。
+支持范围、内存布局和来源见 [VP9 说明](docs/vp9.md)，检查结果见
+[VP9 验证记录](docs/vp9-validation.md)。
+
+同源 FFmpeg 8.1 增补 VP9 Request 后，1080p 600 帧三轮中位数为硬件
+224.01 fps、四线程软件 68.94 fps。输入、CPU 用量及测量条件见
+[VP9 benchmark](docs/vp9-benchmark.md)。
+
+H.264 与 HEVC 经过板端测试的范围为逐行、8 bit、4:2:0 的 H.264 Baseline、Main、High 以及 HEVC
 Main、Main Still Picture。OUTPUT 格式为 `V4L2_PIX_FMT_H264_SLICE` 或
 `V4L2_PIX_FMT_HEVC_SLICE`，使用 Annex-B、每个请求提交完整帧；CAPTURE 格式为
 `V4L2_PIX_FMT_NV12`。当前尺寸上限为 4096×2304，硬件测试覆盖至 3840×2160。
@@ -37,12 +47,12 @@ sudo sh tools/board-load.sh
 ```
 
 `board-build.sh` 检查头文件的 `kernel.release` 与 `uname -r`。目标 RevyOS
-内核缺少 `v4l2-mem2mem` 和 `v4l2-h264` helper，脚本从 kernel.org 获取匹配
-版本的 Linux GPL 源文件，在 `build/helpers-<kernel-release>/` 编译这两个
+内核缺少 codec helper，脚本从 kernel.org 获取匹配版本的 Linux GPL 源文件，
+在 `build/helpers-<kernel-release>/` 编译 `v4l2-mem2mem`、`v4l2-h264` 和 `v4l2-vp9`
 模块，再构建驱动；`SOURCES` 记录下载地址。
 
 加载前应关闭占用解码设备的程序。`board-load.sh` 在当前启动期间卸载原解码
-模块，装载媒体依赖、两个 helper 和 `th1520-vdec.ko`，最后显示设备编号。
+模块，装载媒体依赖、三个 helper 和 `th1520-vdec.ko`，最后显示设备编号。
 模块与构建产物保存在工作目录，开机配置保持原样；重启后沿用系统原有的加载
 配置。再次测试时重新执行 `board-load.sh`。
 
@@ -141,8 +151,10 @@ GStreamer 1.22.0 的 HEVC 裁剪性能修复使 1080p 从 6.86 fps 提高到
 三项短样本共 28 帧与软件逐字节相同。临时构建与 Request 选择方式见
 [FFmpeg Request 说明](docs/ffmpeg-request.md)。
 
-watchdog 故障注入专项尚未运行。IRQ 与 watchdog 的作业完成权通过代码审查，
-该项状态与截断码流恢复测试分别记录在 [验证记录](docs/validation.md)。
+当前 MMIO 使用标准 `readl()`、`writel()`。此前 relaxed MMIO 的 6000 帧
+交替比较仅观察到约 0.2–0.3% 的吞吐量增加。
+像素、并发、合规和独立 watchdog 故障注入后的恢复检查通过，详见
+[MMIO 验证](docs/mmio-performance.md) 与 [验证记录](docs/validation.md)。
 
 ## 文档与上游接口
 

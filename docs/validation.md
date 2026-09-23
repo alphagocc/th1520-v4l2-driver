@@ -57,6 +57,7 @@ scaling list、多 slice、尺寸裁剪、1080p 和 3840×2160。640×360 的
 | H.264 `data_offset=13` | 输出像素检查通过 |
 | 正常帧、截断帧、恢复帧 | 截断请求返回 ERROR，恢复帧像素通过 |
 | 七种异常 HEVC 控件 | 请求被拒绝并返回 ERROR，测试按时完成 |
+| 丢失完成通知后的 watchdog 恢复 | 独立测试模块在 IRQ 确认后丢弃一次完成通知；2242 ms 后返回 ERROR，同一 context 下一帧像素全部匹配 |
 
 七种异常 HEVC 控件覆盖 CB 尺寸范围、tile 数量、非均匀 tile 宽高、POC 计数
 及 SPS 与缓冲尺寸的匹配检查。这些结果补充合法码流验证。
@@ -81,8 +82,9 @@ scaling list、多 slice、尺寸裁剪、1080p 和 3840×2160。640×360 的
 
 ## 尚待验证的范围
 
-watchdog 故障注入专项尚未运行。IRQ 与 watchdog 的作业完成权通过代码审查；
-截断码流恢复属于单独的错误处理测试，无法替代丢失中断或硬件停滞测试。
+watchdog 在丢失一次完成通知的独立故障注入中通过恢复检查，详见
+[relaxed MMIO 验证](mmio-performance.md)。真实硬件持续忙碌时的 abort
+轮询仍需单独验证。截断码流恢复继续作为独立错误处理测试记录。
 
 1080p 的 V4L2、FFmpeg 软件及厂商 OMX 速度比较见
 [benchmark 记录](benchmark.md)。4K benchmark 按用户指示取消；此前 4K

@@ -57,11 +57,15 @@ sh tools/benchmark-decode.sh "$PWD" test-results/benchmark-decode \
   --threads 1,4 --target-seconds 5 --rounds 3
 ```
 
-生成脚本使用 FFmpeg `testsrc2`，1080p 每份 600 帧，4K 每份 300 帧，输入
+生成脚本使用 FFmpeg `testsrc2`，默认生成 1080p 每份 600 帧，输入
 均为逐行 8 bit 4:2:0。H.264 使用 libx264 High、QP 24、veryfast，HEVC
 使用 libx265 Main、CRF 28、ultrafast，GOP 长度均为 60。具体编码参数、
 生成器版本、帧数和 SHA-256 保存在输出目录。样本可在另一台计算机生成后
 传送到开发板，编码耗时排除在解码测量之外。
+
+`FRAMES_1080=6000` 可生成连续的 6000 帧长输入。4K 默认关闭，仅在设置
+`INCLUDE_4K=1` 时生成各 300 帧的额外输入。本次 MMIO 对照使用长输入，
+结果见 [relaxed MMIO 记录](mmio-performance.md)。
 
 `--input` 接受带参数集、从随机访问图像开始的完整 Annex-B 文件。默认输入
 为现有两个 1080p 矩阵样本。脚本通过串接完整序列增加测量长度，记录实际

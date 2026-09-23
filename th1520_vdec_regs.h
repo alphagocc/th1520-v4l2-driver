@@ -79,13 +79,14 @@ struct th1520_vdec_reg {
 #define TH1520_IRQ_DEC_STRM_CORRUPTED	BIT(1)
 #define TH1520_IRQ_DEC_E		BIT(0)
 
-#define TH1520_IRQ_STAT_MASK		GENMASK(23, 11)
+/* SDK product-table field 2127 covers all fifteen status bits. */
+#define TH1520_IRQ_STAT_MASK		GENMASK(25, 11)
 
 #define TH1520_IRQ_ERROR_MASK \
 	(TH1520_IRQ_DEC_TIMEOUT | TH1520_IRQ_DEC_ERROR_INT | \
 	 TH1520_IRQ_DEC_BUS_INT | TH1520_IRQ_DEC_BUFFER_INT)
 
-#define th1520_dec_irq_stat		TH1520_REG(1, 11, 0x1fff)
+#define th1520_dec_irq_stat		TH1520_REG(1, 11, 0x7fff)
 #define th1520_dec_irq			TH1520_REG(1, 8, 0x1)
 #define th1520_dec_tile_int_e		TH1520_REG(1, 7, 0x1)
 #define th1520_dec_abort_e		TH1520_REG(1, 5, 0x1)

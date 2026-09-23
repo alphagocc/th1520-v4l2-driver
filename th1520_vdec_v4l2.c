@@ -47,6 +47,11 @@ static const struct th1520_vdec_fmt th1520_vdec_formats[] = {
 		.codec_mode = TH1520_MODE_HEVC_DEC,
 		.is_bitstream = true,
 	},
+	{
+		.fourcc = V4L2_PIX_FMT_VP9_FRAME,
+		.codec_mode = TH1520_MODE_VP9_DEC,
+		.is_bitstream = true,
+	},
 };
 
 /*
@@ -76,7 +81,7 @@ th1520_vdec_nv12_size(const struct v4l2_pix_format_mplane *pix_mp)
 }
 
 /*
- * 两个 codec 的原生帧及 direct-MV 都使用私有缓冲。
+ * 各 codec 的原生帧及 motion vectors 都使用私有缓冲。
  * CAPTURE 的分配大小和 payload 均为线性 NV12 图像字节数。
  */
 static void
@@ -119,7 +124,7 @@ static int th1520_vdec_enum_fmt(struct file *file, void *priv,
 
 		/*
 		 * CAPTURE 侧的可用格式取决于已经选定的 OUTPUT 码流格式；
-		 * 当前两个 codec 都只输出 8 bit NV12。
+		 * 当前各 codec 都只输出 8 bit NV12。
 		 */
 		if (capture && !ctx->vpu_src_fmt)
 			continue;
@@ -157,10 +162,11 @@ static int th1520_vdec_enum_framesizes(struct file *file, void *priv,
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise.min_width = TH1520_MIN_WIDTH;
 	fsize->stepwise.max_width = TH1520_MAX_WIDTH;
-	fsize->stepwise.step_width = TH1520_MB_DIM;
+	fsize->stepwise.step_width = fsize->pixel_format == V4L2_PIX_FMT_VP9_FRAME ?
+				     2 : TH1520_MB_DIM;
 	fsize->stepwise.min_height = TH1520_MIN_HEIGHT;
 	fsize->stepwise.max_height = TH1520_MAX_HEIGHT;
-	fsize->stepwise.step_height = TH1520_MB_DIM;
+	fsize->stepwise.step_height = fsize->stepwise.step_width;
 
 	return 0;
 }
@@ -212,14 +218,21 @@ static int th1520_vdec_try_fmt(struct th1520_vdec_ctx *ctx,
 		 */
 		pix_mp->width = ctx->src_fmt.width;
 		pix_mp->height = ctx->src_fmt.height;
+		if (ctx->vpu_src_fmt->codec_mode == TH1520_MODE_VP9_DEC) {
+			pix_mp->width = ALIGN(pix_mp->width, TH1520_MB_DIM);
+			pix_mp->height = ALIGN(pix_mp->height, TH1520_MB_DIM);
+		}
 		pix_mp->colorspace = ctx->src_fmt.colorspace;
 		pix_mp->xfer_func = ctx->src_fmt.xfer_func;
 		pix_mp->ycbcr_enc = ctx->src_fmt.ycbcr_enc;
 		pix_mp->quantization = ctx->src_fmt.quantization;
 		th1520_vdec_fill_pixfmt_cap(pix_mp);
 	} else {
-		pix_mp->width = ALIGN(pix_mp->width, TH1520_MB_DIM);
-		pix_mp->height = ALIGN(pix_mp->height, TH1520_MB_DIM);
+		unsigned int alignment = fmt->codec_mode == TH1520_MODE_VP9_DEC ?
+					 2 : TH1520_MB_DIM;
+
+		pix_mp->width = ALIGN(pix_mp->width, alignment);
+		pix_mp->height = ALIGN(pix_mp->height, alignment);
 		th1520_vdec_fill_pixfmt_out(pix_mp);
 	}
 
@@ -272,6 +285,9 @@ static int th1520_vdec_s_fmt_out(struct file *file, void *priv,
 	case TH1520_MODE_HEVC_DEC:
 		ctx->codec_ops = &th1520_vdec_hevc_ops;
 		break;
+	case TH1520_MODE_VP9_DEC:
+		ctx->codec_ops = &th1520_vdec_vp9_ops;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -279,6 +295,10 @@ static int th1520_vdec_s_fmt_out(struct file *file, void *priv,
 	/* 同步 CAPTURE 侧的分辨率与缓冲大小。 */
 	ctx->dst_fmt.width = ctx->src_fmt.width;
 	ctx->dst_fmt.height = ctx->src_fmt.height;
+	if (ctx->vpu_src_fmt->codec_mode == TH1520_MODE_VP9_DEC) {
+		ctx->dst_fmt.width = ALIGN(ctx->dst_fmt.width, TH1520_MB_DIM);
+		ctx->dst_fmt.height = ALIGN(ctx->dst_fmt.height, TH1520_MB_DIM);
+	}
 	ctx->dst_fmt.colorspace = ctx->src_fmt.colorspace;
 	ctx->dst_fmt.xfer_func = ctx->src_fmt.xfer_func;
 	ctx->dst_fmt.ycbcr_enc = ctx->src_fmt.ycbcr_enc;
@@ -320,6 +340,11 @@ static int th1520_vdec_g_selection(struct file *file, void *priv,
 	switch (sel->target) {
 	case V4L2_SEL_TGT_COMPOSE:
 	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = ctx->src_fmt.width;
+		sel->r.height = ctx->src_fmt.height;
+		return 0;
 	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
 	case V4L2_SEL_TGT_COMPOSE_PADDED:
 		sel->r.left = 0;
@@ -413,6 +438,9 @@ static int th1520_vdec_buf_prepare(struct vb2_buffer *vb)
 			case TH1520_MODE_HEVC_DEC:
 				size = th1520_vdec_hevc_native_size(ctx);
 				break;
+			case TH1520_MODE_VP9_DEC:
+				size = th1520_vdec_vp9_native_size(ctx);
+				break;
 			default:
 				return -EINVAL;
 			}
@@ -424,6 +452,7 @@ static int th1520_vdec_buf_prepare(struct vb2_buffer *vb)
 			buf->native.size = size;
 		}
 
+		buf->vp9.valid = false;
 		vb2_set_plane_payload(vb, 0, th1520_vdec_nv12_size(pix_mp));
 	}
 
@@ -441,6 +470,7 @@ static void th1520_vdec_buf_cleanup(struct vb2_buffer *vb)
 				  buf->native.cpu, buf->native.dma);
 		memset(&buf->native, 0, sizeof(buf->native));
 	}
+	memset(&buf->vp9, 0, sizeof(buf->vp9));
 }
 
 static void th1520_vdec_buf_queue(struct vb2_buffer *vb)
@@ -505,6 +535,18 @@ static void th1520_vdec_stop_streaming(struct vb2_queue *q)
 {
 	struct th1520_vdec_ctx *ctx = vb2_get_drv_priv(q);
 	struct vb2_v4l2_buffer *buf;
+	struct vb2_queue *cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	unsigned int i;
+
+	/* STREAMOFF invalidates both VP9 probabilities and reference contents. */
+	if (ctx->codec_ops && ctx->codec_ops->abort)
+		ctx->codec_ops->abort(ctx);
+	for (i = 0; i < cap_q->num_buffers; i++) {
+		struct vb2_buffer *vb = vb2_get_buffer(cap_q, i);
+
+		if (vb)
+			th1520_vdec_vbuf_to_buffer(to_vb2_v4l2_buffer(vb))->vp9.valid = false;
+	}
 
 	if (V4L2_TYPE_IS_OUTPUT(q->type) && ctx->codec_ops &&
 	    ctx->codec_ops->exit)
@@ -616,6 +658,22 @@ static int th1520_vdec_try_ctrl(struct v4l2_ctrl *ctrl)
 			return -EINVAL;
 		break;
 	}
+	case V4L2_CID_STATELESS_VP9_FRAME: {
+		const struct v4l2_ctrl_vp9_frame *frame = ctrl->p_new.p_vp9_frame;
+		u32 width = frame->frame_width_minus_1 + 1;
+		u32 height = frame->frame_height_minus_1 + 1;
+		u32 subsampling = V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING |
+				  V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING;
+
+		if (frame->profile != 0 || frame->bit_depth != 8 ||
+		    (frame->flags & subsampling) != subsampling)
+			return -EINVAL;
+		if (width < TH1520_MIN_WIDTH || width > TH1520_MAX_WIDTH ||
+		    height < TH1520_MIN_HEIGHT || height > TH1520_MAX_HEIGHT ||
+		    (width & 1) || (height & 1))
+			return -EINVAL;
+		break;
+	}
 	default:
 		break;
 	}
@@ -657,6 +715,18 @@ static const struct v4l2_ctrl_hevc_sps th1520_vdec_hevc_default_sps = {
 	.log2_max_pic_order_cnt_lsb_minus4 = 4,
 	.log2_diff_max_min_luma_coding_block_size = 3,
 	.log2_diff_max_min_luma_transform_block_size = 3,
+};
+
+static const struct v4l2_ctrl_vp9_frame th1520_vdec_vp9_default_frame = {
+	.flags = V4L2_VP9_FRAME_FLAG_KEY_FRAME |
+		 V4L2_VP9_FRAME_FLAG_SHOW_FRAME |
+		 V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING |
+		 V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING,
+	.frame_width_minus_1 = TH1520_DEFAULT_WIDTH - 1,
+	.frame_height_minus_1 = TH1520_DEFAULT_HEIGHT - 1,
+	.render_width_minus_1 = TH1520_DEFAULT_WIDTH - 1,
+	.render_height_minus_1 = TH1520_DEFAULT_HEIGHT - 1,
+	.bit_depth = 8,
 };
 
 /*
@@ -745,6 +815,22 @@ static const struct th1520_vdec_ctrl_desc th1520_vdec_ctrls[] = {
 			 .min = V4L2_MPEG_VIDEO_HEVC_LEVEL_1,
 			 .max = V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1,
 			 .def = V4L2_MPEG_VIDEO_HEVC_LEVEL_4 },
+	},
+	/* --- VP9: parsed frame and compressed header, one frame per request. --- */
+	{
+		.codec = TH1520_MODE_VP9_DEC,
+		.cfg = { .id = V4L2_CID_STATELESS_VP9_FRAME,
+			 .ops = &th1520_vdec_ctrl_ops,
+			 .p_def = { .p_const = &th1520_vdec_vp9_default_frame } },
+	}, {
+		.codec = TH1520_MODE_VP9_DEC,
+		.cfg = { .id = V4L2_CID_STATELESS_VP9_COMPRESSED_HDR },
+	}, {
+		.codec = TH1520_MODE_VP9_DEC,
+		.cfg = { .id = V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
+			 .min = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
+			 .max = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
+			 .def = V4L2_MPEG_VIDEO_VP9_PROFILE_0 },
 	},
 };
 

@@ -8,6 +8,8 @@
  * Copyright (C) 2018 Collabora, Ltd.
  * Copyright 2018 Google LLC.
  *     Tomasz Figa <tfiga@chromium.org>
+ * Request validation also follows the Linux vicodec driver:
+ * Copyright 2018 Cisco Systems, Inc. and/or its affiliates. All rights reserved.
  * Based on the s5p-mfc driver:
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  *
@@ -84,6 +86,9 @@ static void th1520_vdec_job_finish_no_pm(struct th1520_vdec_dev *vpu,
 
 	if (WARN_ON(!src) || WARN_ON(!dst))
 		return;
+
+	if (result == VB2_BUF_STATE_ERROR && ctx->codec_ops->abort)
+		ctx->codec_ops->abort(ctx);
 
 	src->sequence = ctx->sequence_out++;
 	dst->sequence = ctx->sequence_cap++;
@@ -198,8 +203,10 @@ static void th1520_vdec_device_run(void *priv)
 	struct th1520_vdec_ctx *ctx = priv;
 	struct th1520_vdec_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *src, *dst;
+	bool submitted = false;
 	int ret;
 
+	mutex_lock(&vpu->run_mutex);
 	src = th1520_vdec_get_src_buf(ctx);
 	dst = th1520_vdec_get_dst_buf(ctx);
 	if (WARN_ON(!src) || WARN_ON(!dst))
@@ -229,6 +236,7 @@ static void th1520_vdec_device_run(void *priv)
 	v4l2_m2m_buf_copy_metadata(src, dst);
 #endif
 
+	submitted = true;
 	if (ctx->codec_ops->run(ctx)) {
 		clk_bulk_disable(TH1520_VDEC_NUM_CLOCKS, vpu->clocks);
 		pm_runtime_mark_last_busy(vpu->dev);
@@ -236,14 +244,45 @@ static void th1520_vdec_device_run(void *priv)
 		goto err_cancel_job;
 	}
 
+	mutex_unlock(&vpu->run_mutex);
 	return;
 
 err_cancel_job:
+	/* Codec run() completes its controls; cover failures before entering it. */
+	if (!submitted && src)
+		v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req,
+					   &ctx->ctrl_handler);
 	th1520_vdec_job_finish_no_pm(vpu, ctx, VB2_BUF_STATE_ERROR);
+	mutex_unlock(&vpu->run_mutex);
+}
+
+static void th1520_vdec_job_abort(void *priv)
+{
+	struct th1520_vdec_ctx *ctx = priv;
+	struct th1520_vdec_dev *vpu = ctx->dev;
+	unsigned long flags;
+	bool claimed;
+
+	mutex_lock(&vpu->run_mutex);
+	spin_lock_irqsave(&vpu->irqlock, flags);
+	claimed = vpu->active_ctx == ctx;
+	if (claimed)
+		vpu->active_ctx = NULL;
+	spin_unlock_irqrestore(&vpu->irqlock, flags);
+
+	if (claimed) {
+		cancel_delayed_work(&vpu->watchdog_work);
+		if (ctx->codec_ops->reset)
+			ctx->codec_ops->reset(ctx);
+		th1520_vdec_job_finish(vpu, ctx, VB2_BUF_STATE_ERROR);
+	}
+	/* If IRQ or watchdog claimed the job, the M2M core waits for it. */
+	mutex_unlock(&vpu->run_mutex);
 }
 
 static const struct v4l2_m2m_ops th1520_vdec_m2m_ops = {
 	.device_run = th1520_vdec_device_run,
+	.job_abort = th1520_vdec_job_abort,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -327,10 +366,45 @@ const struct v4l2_file_operations th1520_vdec_fops = {
 
 static int th1520_vdec_request_validate(struct media_request *req)
 {
-	/*
-	 * Stateless 解码器要求每个 request 至少携带一个 OUTPUT buffer。
-	 * 具体的控件完整性检查由各 codec 后端在 run() 里做。
-	 */
+	struct media_request_object *obj;
+	struct th1520_vdec_ctx *ctx = NULL;
+	struct v4l2_ctrl_handler *hdl;
+	unsigned int count = vb2_request_buffer_cnt(req);
+	bool has_frame, has_compressed;
+
+	if (!count)
+		return -ENOENT;
+	if (count != 1)
+		return -EINVAL;
+
+	list_for_each_entry(obj, &req->objects, list) {
+		struct vb2_buffer *vb;
+
+		if (!vb2_request_object_is_buffer(obj))
+			continue;
+		vb = container_of(obj, struct vb2_buffer, req_obj);
+		if (!V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
+			return -EINVAL;
+		ctx = vb2_get_drv_priv(vb->vb2_queue);
+		break;
+	}
+	if (!ctx)
+		return -ENOENT;
+
+	if (ctx->vpu_src_fmt->codec_mode == TH1520_MODE_VP9_DEC) {
+		/* Presence is per request; a previous frame's controls cannot carry. */
+		hdl = v4l2_ctrl_request_hdl_find(req, &ctx->ctrl_handler);
+		if (!hdl)
+			return -ENOENT;
+		has_frame = v4l2_ctrl_request_hdl_ctrl_find(hdl,
+					 V4L2_CID_STATELESS_VP9_FRAME) != NULL;
+		has_compressed = v4l2_ctrl_request_hdl_ctrl_find(hdl,
+					 V4L2_CID_STATELESS_VP9_COMPRESSED_HDR) != NULL;
+		v4l2_ctrl_request_hdl_put(hdl);
+		if (!has_frame || !has_compressed)
+			return -ENOENT;
+	}
+
 	return vb2_request_validate(req);
 }
 
@@ -539,6 +613,7 @@ static int th1520_vdec_probe(struct platform_device *pdev)
 	vpu->dev = &pdev->dev;
 	vpu->pdev = pdev;
 	mutex_init(&vpu->vpu_mutex);
+	mutex_init(&vpu->run_mutex);
 	spin_lock_init(&vpu->irqlock);
 	INIT_DELAYED_WORK(&vpu->watchdog_work, th1520_vdec_watchdog);
 	platform_set_drvdata(pdev, vpu);

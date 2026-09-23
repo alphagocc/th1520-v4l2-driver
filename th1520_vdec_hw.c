@@ -256,7 +256,12 @@ void th1520_vdec_set_common_config(struct th1520_vdec_ctx *ctx)
 		th1520_vdec_common_config_h264(ctx);
 		break;
 	case TH1520_MODE_HEVC_DEC:
+	case TH1520_MODE_VP9_DEC:
 		th1520_vdec_common_config_hevc(ctx);
+		/* SDK Vp9AsicInit uses the same SetCommonConfigRegs branch. */
+		if (ctx->vpu_src_fmt->codec_mode == TH1520_MODE_VP9_DEC)
+			th1520_vdec_reg_write(ctx->dev, &th1520_dec_mode,
+					       TH1520_DEC_MODE_VP9);
 		break;
 	default:
 		break;
@@ -347,7 +352,7 @@ void th1520_vdec_start(struct th1520_vdec_dev *vpu)
 
 	vdpu_write(vpu, vpu->regs[2], TH1520_VDEC_REG_OFF(2));
 
-	/* 确保前面的寄存器都已落地再拉 GO。 */
+	/* Publish DMA data and configuration before the ordered start write. */
 	wmb();
 	vdpu_write(vpu, vpu->regs[TH1520_VDEC_SWREG_IRQ],
 		   TH1520_VDEC_REG_OFF(TH1520_VDEC_SWREG_IRQ));
@@ -425,6 +430,9 @@ irqreturn_t th1520_vdec_irq(int irq, void *dev_id)
 	    !(status & (TH1520_IRQ_ERROR_MASK | TH1520_IRQ_DEC_ABORT_INT |
 			TH1520_IRQ_DEC_STRM_CORRUPTED))) {
 		state = VB2_BUF_STATE_DONE;
+		if (ctx->codec_ops->check_result &&
+		    ctx->codec_ops->check_result(ctx, status))
+			state = VB2_BUF_STATE_ERROR;
 	} else {
 		state = VB2_BUF_STATE_ERROR;
 
@@ -448,12 +456,13 @@ irqreturn_t th1520_vdec_irq(int irq, void *dev_id)
 
 		/*
 		 * 时钟此时仍然使能（job_finish() 还没跑），可以安全回读。
-		 * swreg260 是 HEVC 的错误定位寄存器：
-		 *   [31:24] ERROR_ADDR_X / [23:16] ERROR_ADDR_Y
-		 *   [3] ERROR_SLICE_HEADER / [2:0] ERROR_SLICE_DATA
+		 * 产品表中的错误定位字段位于 swreg261：
+		 *   [31:22] ERROR_ADDR_X / [21:12] ERROR_ADDR_Y
+		 *   [0] ERROR_SLICE_HEADER / [5:3] ERROR_SLICE_DATA
+		 * 旧注释把 G2 的 swreg260 沿用到此处；此处更正为产品表坐标。
 		 */
-		dev_err(vpu->dev, "error info swreg260=0x%08x\n",
-			vdpu_read(vpu, TH1520_VDEC_REG_OFF(260)));
+		dev_err(vpu->dev, "error info swreg261=0x%08x\n",
+			vdpu_read(vpu, TH1520_VDEC_REG_OFF(261)));
 		th1520_vdec_dump_regs(vpu, "decode error");
 	}
 

@@ -17,6 +17,7 @@
 | `th1520_vdec_h264.c` | [hantro_h264.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_h264.c)、[hantro_g1_h264_dec.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_g1_h264_dec.c) | DPB、参考列表及辅助表处理 |
 | `th1520_vdec_h264_cabac.c` | [hantro_h264.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_h264.c) | 完整的 920 字 CABAC 初始化表 |
 | `th1520_vdec_hevc.c` | [hantro_hevc.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_hevc.c)、[hantro_g2_hevc_dec.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_g2_hevc_dec.c) | Tile、缩放矩阵和参考帧辅助处理 |
+| `th1520_vdec_vp9.c`、`th1520_vdec_vp9_probs.c`、`th1520_vdec_vp9_probs.h` | [hantro_vp9.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_vp9.c)、[hantro_vp9.h](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_vp9.h)、[hantro_g2_vp9_dec.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_g2_vp9_dec.c) | 概率表、计数器转换和 codec 软件处理；TH1520 SDK 单独核查硬件布局 |
 | `th1520_vdec_regs.h` | [hantro_g1_regs.h](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_g1_regs.h)、[hantro_g2_regs.h](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/platform/verisilicon/hantro_g2_regs.h) | 公共寄存器术语与位域描述辅助形式 |
 
 这些源文件的版权方包括 Rockchip Electronics、Google、Collabora、Samsung
@@ -35,6 +36,10 @@ TH1520 的寄存器坐标、模式选择、MMIO 次序和原生缓冲参数属�
 
 1. [v4l2-mem2mem.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/media/v4l2-core/v4l2-mem2mem.c?h=v6.6.140)
 2. [v4l2-h264.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/media/v4l2-core/v4l2-h264.c?h=v6.6.140)
+3. [v4l2-vp9.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/media/v4l2-core/v4l2-vp9.c?h=v6.6.140)，GPL-2.0，Collabora 2021；其公开头文件采用 GPL-2.0-or-later。
+
+VP9 请求控件存在性检查参考同一固定 Linux commit 的
+[vicodec-core.c](https://github.com/torvalds/linux/blob/8ba098e6b6ff0db8edf28528d1552be261af30d4/drivers/media/test-drivers/vicodec/vicodec-core.c)，保留 Cisco 2018 版权声明。
 
 上面的链接对应本次验证的 v6.6.140。下载文件保存在 Git 忽略的 `build/`
 目录并保留原始许可头，`SOURCES` 记录实际下载版本。正常构建还需要匹配

@@ -23,5 +23,8 @@ fi
 if [ ! -d /sys/module/v4l2_h264 ]; then
     insmod "$HELPERS/v4l2-h264.ko"
 fi
+if [ ! -d /sys/module/v4l2_vp9 ]; then
+    insmod "$HELPERS/v4l2-vp9.ko"
+fi
 insmod "$DRIVER_DIR/th1520-vdec.ko" "$@"
 v4l2-ctl --list-devices
